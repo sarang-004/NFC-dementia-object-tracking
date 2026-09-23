@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CareTrack | NFC Smart Object Tracking</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">NFC</div><div><b>CareTrack</b><small>Smart Object Tracking</small></div></div>
+    <div class="profile"><div class="avatar">C</div><div><b>Caregiver</b><small>Home monitoring</small></div><span class="online"></span></div>
+    <nav>
+      <button class="nav active" data-page="dashboard">⌂ <span>Dashboard</span></button>
+      <button class="nav" data-page="find">⌕ <span>Find Object</span></button>
+      <button class="nav" data-page="voice">🎙 <span>Voice Interaction</span></button>
+      <button class="nav" data-page="objects">▣ <span>Tagged Objects</span></button>
+      <button class="nav" data-page="history">◷ <span>Activity History</span></button>
+      <button class="nav" data-page="locations">⌖ <span>Locations</span></button>
+      <button class="nav" data-page="alerts">⚠ <span>Alerts</span><i>1</i></button>
+    </nav>
+    <div class="sidebar-bottom"><div class="system"><span class="online"></span><div><b>System online</b><small>Demo reader network ready</small></div></div><small>Frontend prototype • v2.0</small></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div><p>CAREGIVER PORTAL</p><h1 id="pageTitle">Dashboard</h1></div>
+      <div class="top-actions"><span class="live">● Live monitoring</span><button id="bell">🔔</button><div class="avatar">C</div></div>
+    </header>
+    <div id="content"></div>
+  </main>
+</div>
+<div id="toast"></div>
+<script src="script.js"></script>
+</body>
+</html>
