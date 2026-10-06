@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+import sqlite3
 
 
 # --------------------------------
@@ -16,10 +17,35 @@ app = FastAPI(
 # --------------------------------
 
 class DetectionEvent(BaseModel):
-
     nfc_uid: str
     reader_id: str
     timestamp: str
+
+
+# --------------------------------
+# Database setup
+# --------------------------------
+
+def init_db():
+
+    connection = sqlite3.connect("nfc_tracking.db")
+
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS detections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nfc_uid TEXT NOT NULL,
+            reader_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+
+    connection.commit()
+    connection.close()
+
+
+init_db()
 
 
 # --------------------------------
@@ -41,6 +67,23 @@ def home():
 
 @app.post("/detection")
 def receive_detection(event: DetectionEvent):
+
+    connection = sqlite3.connect("nfc_tracking.db")
+
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO detections
+        (nfc_uid, reader_id, timestamp)
+        VALUES (?, ?, ?)
+    """, (
+        event.nfc_uid,
+        event.reader_id,
+        event.timestamp
+    ))
+
+    connection.commit()
+    connection.close()
 
     print("\n==============================")
     print("      NFC DETECTION RECEIVED")
