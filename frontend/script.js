@@ -1,4755 +1,1202 @@
 // =====================================================
-// NFC SMART OBJECT TRACKING SYSTEM
-// CAREGIVER PORTAL
+// CARETRACK - CAREGIVER PORTAL
+// ESP32 + PN532 -> FastAPI -> SQLite -> this frontend
 // =====================================================
+"use strict";
 
+// ---------------- CONFIGURATION ----------------
+const API_BASE = "http://127.0.0.1:8000";
+const POLL_MS = 10000;
 
-// =====================================================
-// CONFIGURATION
-// =====================================================
-
-const API_BASE = "http://10.125.99.82:8000";
-
-
-// =====================================================
-// APPLICATION STATE
-// =====================================================
-
-let objects = [];
-let selected = null;
+// ---------------- STATE ----------------
+let objects = [];            // normalized objects (see fromEntry)
 let currentPage = "dashboard";
+let findUid = null;          // object currently shown on Find Object
+let findTerm = "";
+let findCoords = null;
+let voiceUid = null;         // object currently shown on Voice Interaction
+let locData = null;          // last /locations/hierarchy response
+let backendOnline = null;
+let needsReload = false;
+let lastDetId = null;
+let polling = false;
+let recognizing = false;
+let activeRec = null;
+let maps = {};
 
-let dashboardRefreshTimer = null;
-let isRefreshing = false;
+const $ = s => document.querySelector(s);
 
-
-// =====================================================
-// SHORT DOM HELPER
-// =====================================================
-
-const $ = selector =>
-  document.querySelector(selector);
-
-
-// =====================================================
-// OBJECT HELPERS
-// =====================================================
-
-function getObject(uid) {
-
-  if (!uid) {
-    return null;
-  }
-
-  const normalized =
-    uid.trim().toUpperCase();
-
-  return objects.find(
-    object =>
-      object.id.toUpperCase() === normalized
-  ) || null;
+// ---------------- GENERIC HELPERS ----------------
+function esc(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
 
+function setText(id, v) {
+  const e = document.getElementById(id);
+  if (e) e.textContent = v;
+}
 
+function toast(message, isError = false) {
+  const t = $("#toast");
+  if (!t) return;
+  t.textContent = (isError ? "⚠ " : "✓ ") + message;
+  t.style.display = "block";
+  clearTimeout(toast.timeout);
+  toast.timeout = setTimeout(() => { t.style.display = "none"; }, 3200);
+}
+
+const ICONS = [
+  [["key"], "🔑"], [["glass", "spectacle"], "👓"], [["medicine", "tablet", "pill"], "💊"],
+  [["wallet", "purse"], "👛"], [["phone", "mobile"], "📱"], [["watch"], "⌚"],
+  [["remote"], "🎮"], [["bottle"], "🍼"], [["bag"], "👜"],
+];
 function getObjectIcon(name) {
-
-  if (!name) {
-    return "🏷️";
-  }
-
-  const lower =
-    name.toLowerCase();
-
-  if (
-    lower.includes("key")
-  ) {
-    return "🔑";
-  }
-
-  if (
-    lower.includes("glass")
-  )
-  {
-    return "👓";
-  }
-
-  if (
-    lower.includes("medicine") ||
-    lower.includes("tablet") ||
-    lower.includes("pill")
-  ) {
-    return "💊";
-  }
-
-  if (
-    lower.includes("wallet") ||
-    lower.includes("purse")
-  ) {
-    return "👛";
-  }
-
-  if (
-    lower.includes("phone") ||
-    lower.includes("mobile")
-  ) {
-    return "📱";
-  }
-
-  if (
-    lower.includes("watch")
-  ) {
-    return "⌚";
-  }
-
-  if (
-    lower.includes("remote")
-  ) {
-    return "🎮";
-  }
-
-  if (
-    lower.includes("bottle")
-  ) {
-    return "🍼";
-  }
-
-  if (
-    lower.includes("bag")
-  ) {
-    return "👜";
-  }
-
+  const n = (name || "").toLowerCase();
+  for (const [words, icon] of ICONS) if (words.some(w => n.includes(w))) return icon;
   return "🏷️";
 }
 
-
-// =====================================================
-// HTML SAFETY
-// =====================================================
-
-function escapeHtml(value) {
-
-  if (value === null ||
-      value === undefined) {
-    return "";
-  }
-
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function fmtTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return String(ts);
+  return d.toLocaleString("en-IN", {
+    day: "numeric", month: "short", year: "numeric",
+    hour: "numeric", minute: "2-digit", hour12: true,
+  });
 }
 
-
-// =====================================================
-// TOAST
-// =====================================================
-
-function toast(message) {
-
-  const t =
-    $("#toast");
-
-  if (!t) {
-    return;
-  }
-
-  t.textContent =
-    "✓ " + message;
-
-  t.style.display =
-    "block";
-
-  clearTimeout(
-    toast.timeout
-  );
-
-  toast.timeout =
-    setTimeout(() => {
-
-      t.style.display =
-        "none";
-
-    }, 2500);
+function spokenTime(ts) {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "an unknown time";
+  return `${d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })} on ` +
+    d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
 }
 
-
-// =====================================================
-// DATE / TIME
-// =====================================================
-
-function formatTimestamp(timestamp) {
-
-  if (!timestamp) {
-    return "—";
-  }
-
-  const date =
-    new Date(timestamp);
-
-  if (
-    isNaN(
-      date.getTime()
-    )
-  ) {
-    return timestamp;
-  }
-
-  return date.toLocaleString(
-    "en-IN",
-    {
-      day: "numeric",
-      month: "short",
-      year: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true
-    }
-  );
+function isToday(ts) {
+  const d = new Date(ts), n = new Date();
+  return !isNaN(d.getTime()) && d.toDateString() === n.toDateString();
 }
 
-
-function isToday(timestamp) {
-
-  if (!timestamp) {
-    return false;
-  }
-
-  const date =
-    new Date(timestamp);
-
-  if (
-    isNaN(
-      date.getTime()
-    )
-  ) {
-    return false;
-  }
-
-  const today =
-    new Date();
-
-  return (
-    date.getDate() ===
-      today.getDate() &&
-    date.getMonth() ===
-      today.getMonth() &&
-    date.getFullYear() ===
-      today.getFullYear()
-  );
+// "2" -> "Floor 2"; "Floor 2" stays as-is
+function pre(prefix, v) {
+  const s = String(v ?? "").trim();
+  return /^\d+$/.test(s) ? `${prefix} ${s}` : s;
 }
 
-
-// =====================================================
-// BACKEND API
-// =====================================================
-
-
-// -----------------------------------------------------
-// GET ALL REGISTERED OBJECTS
-// -----------------------------------------------------
-
-async function getRegisteredObjects() {
-
-  try {
-
-    const response =
-      await fetch(
-        `${API_BASE}/objects`
-      );
-
-    if (!response.ok) {
-      throw new Error(
-        `Objects request failed (${response.status})`
-      );
-    }
-
-    const data =
-      await response.json();
-
-    if (
-      data.status !==
-      "success"
-    ) {
-      throw new Error(
-        data.message ||
-        "Could not load objects"
-      );
-    }
-
-    return (
-      data.objects || []
-    ).map(object => ({
-
-      id:
-        object.nfc_uid,
-
-      name:
-        object.name ||
-        "Unnamed Object",
-
-      icon:
-        getObjectIcon(
-          object.name
-        ),
-
-      registeredAt:
-        object.registered_at,
-
-      building:
-        "—",
-
-      floor:
-        "—",
-
-      room:
-        "—",
-
-      reader:
-        "—",
-
-      time:
-        "—",
-
-      timestamp:
-        null,
-
-      status:
-        "Not detected"
-
-    }));
-
-  } catch (error) {
-
-    console.error(
-      "Object loading error:",
-      error
-    );
-
-    return [];
-
-  }
+function locParts(l) {
+  if (!l) return [];
+  return [l.building, l.floor && pre("Floor", l.floor), l.room && pre("Room", l.room)]
+    .filter(Boolean);
 }
 
-
-// -----------------------------------------------------
-// REFRESH OBJECT LIST
-// -----------------------------------------------------
-
-async function refreshObjects(
-  showError = true
-) {
-
-  try {
-
-    const loaded =
-      await getRegisteredObjects();
-
-    objects =
-      loaded;
-
-    /*
-     * Keep selected object valid.
-     */
-    if (selected) {
-
-      selected =
-        getObject(
-          selected.id
-        );
-
-    }
-
-    if (
-      !selected &&
-      objects.length > 0
-    ) {
-
-      selected =
-        objects[0];
-
-    }
-
-    return objects;
-
-  } catch (error) {
-
-    console.error(
-      error
-    );
-
-    if (showError) {
-
-      toast(
-        "Could not load objects"
-      );
-
-    }
-
-    return objects;
-
-  }
+// Returns [lat, lng] only when both are present and in range
+function coordsOf(l) {
+  if (!l || l.latitude == null || l.longitude == null || l.latitude === "" || l.longitude === "") return null;
+  const la = Number(l.latitude), lo = Number(l.longitude);
+  if (!Number.isFinite(la) || !Number.isFinite(lo)) return null;
+  if (la < -90 || la > 90 || lo < -180 || lo > 180) return null;
+  return [la, lo];
 }
 
+const osmUrl = (c, z = 18) =>
+  `https://www.openstreetmap.org/?mlat=${c[0]}&mlon=${c[1]}#map=${z}/${c[0]}/${c[1]}`;
 
-// -----------------------------------------------------
-// GET LATEST DETECTION
-// -----------------------------------------------------
+const osmLink = c =>
+  `<a href="${osmUrl(c)}" target="_blank" rel="noopener">Open in OpenStreetMap</a>`;
 
-async function getLatestDetection(
-  uid,
-  showError = false
-) {
+const rid = id => String(id).replace(/[^A-Za-z0-9_-]/g, "_");
 
-  try {
+const errBox = m => `<p class="errbox">${esc(m)}</p>`;
+const loadingBox = m => `<p style="color:#718096;font-size:10px">${esc(m)}</p>`;
 
-    const response =
-      await fetch(
-        `${API_BASE}/object/${encodeURIComponent(uid)}/latest`
-      );
-
-    if (!response.ok) {
-
-      if (
-        response.status === 404
-      ) {
-        return null;
-      }
-
-      throw new Error(
-        `Detection request failed (${response.status})`
-      );
-
-    }
-
-    const data =
-      await response.json();
-
-    if (
-      data.status !==
-      "success"
-    ) {
-      return null;
-    }
-
-    return data;
-
-  } catch (error) {
-
-    console.error(
-      `Detection error for ${uid}:`,
-      error
-    );
-
-    if (showError) {
-
-      toast(
-        "Could not connect to backend"
-      );
-
-    }
-
-    return null;
-  }
-}
-
-
-// -----------------------------------------------------
-// GET READER LOCATION
-// -----------------------------------------------------
-
-async function getReaderLocation(
-  readerId,
-  showError = false
-) {
-
-  if (!readerId) {
-    return null;
-  }
-
-  try {
-
-    const response =
-      await fetch(
-        `${API_BASE}/reader/${encodeURIComponent(readerId)}/location`
-      );
-
-    if (!response.ok) {
-
-      if (
-        response.status === 404
-      ) {
-        return null;
-      }
-
-      throw new Error(
-        `Location request failed (${response.status})`
-      );
-
-    }
-
-    const data =
-      await response.json();
-
-    if (
-      data.status !==
-      "success"
-    ) {
-      return null;
-    }
-
-    return data;
-
-  } catch (error) {
-
-    console.error(
-      `Location error for ${readerId}:`,
-      error
-    );
-
-    if (showError) {
-
-      toast(
-        "Could not load reader location"
-      );
-
-    }
-
-    return null;
-  }
-}
-
-
-// -----------------------------------------------------
-// REGISTER OBJECT
-// -----------------------------------------------------
-
-async function registerObject(
-  name,
-  uid
-) {
-
-  const response =
-    await fetch(
-      `${API_BASE}/objects/register`,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify({
-            nfc_uid:
-              uid,
-
-            name:
-              name
-          })
-      }
-    );
-
-
-  let data = null;
-
-  try {
-
-    data =
-      await response.json();
-
-  } catch {
-
-    data = null;
-
-  }
-
-
-if (!response.ok) {
-
-  let message = `Registration failed (${response.status})`;
-
+// ---------------- BACKEND ----------------
+function errMsg(data, status) {
   if (data) {
-
-    if (typeof data.detail === "string") {
-      message = data.detail;
+    if (typeof data.detail === "string") return data.detail;
+    if (Array.isArray(data.detail)) {
+      return data.detail.map(e => (typeof e === "string" ? e : e.msg || JSON.stringify(e))).join(", ");
     }
-
-    else if (Array.isArray(data.detail)) {
-
-      message = data.detail
-        .map(error => {
-
-          if (typeof error === "string") {
-            return error;
-          }
-
-          return error.msg || JSON.stringify(error);
-
-        })
-        .join(", ");
-
-    }
-
-    else if (data.message) {
-
-      message =
-        typeof data.message === "string"
-          ? data.message
-          : JSON.stringify(data.message);
-
-    }
-
+    if (typeof data.message === "string") return data.message;
   }
-
-  throw new Error(message);
+  return `Request failed (${status})`;
 }
 
-
-  if (
-    data &&
-    data.status !==
-    "success"
-  ) {
-
-    throw new Error(
-      data.message ||
-      "Registration failed"
-    );
-
+function setOnline(ok) {
+  if (backendOnline === ok) return;
+  if (ok && backendOnline === false) needsReload = true;
+  backendOnline = ok;
+  const live = $("#liveStatus");
+  if (live) {
+    live.textContent = ok ? "● Live monitoring" : "● Backend offline";
+    live.classList.toggle("offline", !ok);
   }
+  setText("sysStatus", ok ? "System online" : "Backend unreachable");
+  setText("sysDetail", ok ? "Connected to the CareTrack API" : `Cannot reach ${API_BASE}`);
+  if (!ok) toast("Cannot reach the backend", true);
+}
 
-
+async function api(path, opts) {
+  let res;
+  try {
+    res = await fetch(API_BASE + path, opts);
+  } catch (e) {
+    setOnline(false);
+    throw new Error("Cannot reach the backend. Is it running?");
+  }
+  setOnline(true);
+  let data = null;
+  try { data = await res.json(); } catch { data = null; }
+  if (!res.ok) throw new Error(errMsg(data, res.status));
+  if (!data || typeof data !== "object") throw new Error("Unexpected response from the backend.");
   return data;
-
 }
 
-
-// =====================================================
-// UPDATE OBJECT WITH LATEST DETECTION
-// =====================================================
-
-async function updateObjectDetectionInfo() {
-
-  if (
-    objects.length === 0
-  ) {
-    return;
-  }
-
-
-  /*
-   * Fetch latest detection for
-   * every registered object.
-   */
-
-  await Promise.all(
-
-    objects.map(
-      async object => {
-
-        const detection =
-          await getLatestDetection(
-            object.id
-          );
-
-
-        if (
-          !detection
-        ) {
-
-          object.status =
-            "Not detected";
-
-          object.reader =
-            "—";
-
-          object.building =
-            "—";
-
-          object.floor =
-            "—";
-
-          object.room =
-            "—";
-
-          object.time =
-            "—";
-
-          object.timestamp =
-            null;
-
-          return;
-
-        }
-
-
-        object.reader =
-          detection.reader_id;
-
-        object.timestamp =
-          detection.timestamp;
-
-        object.time =
-          formatTimestamp(
-            detection.timestamp
-          );
-
-        object.status =
-          "Detected";
-
-
-        /*
-         * Resolve reader → location.
-         */
-
-        const location =
-          await getReaderLocation(
-            detection.reader_id
-          );
-
-
-        if (
-          location
-        ) {
-
-          object.building =
-            location.building ||
-            "—";
-
-          object.floor =
-            location.floor ||
-            "—";
-
-          object.room =
-            location.room ||
-            "—";
-
-        }
-
-      }
-    )
-
-  );
-
-}
-
-
-// =====================================================
-// NAVIGATION
-// =====================================================
-
-function nav(page) {
-
-  currentPage =
-    page;
-
-
-  /*
-   * Update sidebar active state.
-   */
-
-  document
-    .querySelectorAll(".nav")
-    .forEach(button => {
-
-      button.classList.toggle(
-        "active",
-        button.dataset.page ===
-          page
-      );
-
-    });
-
-
-  const titles = {
-
-    dashboard:
-      "Dashboard",
-
-    find:
-      "Find Object",
-
-    voice:
-      "Voice Interaction",
-
-    objects:
-      "Tagged Objects",
-
-    history:
-      "Activity History",
-
-    locations:
-      "Locations",
-
-    alerts:
-      "Alerts"
-
+// entry = { object, latest_detection, location }  (same shape as GET /object/{uid})
+function fromEntry(e) {
+  const o = (e && e.object) || {};
+  return {
+    id: o.nfc_uid,
+    name: o.name || "Unnamed Object",
+    icon: getObjectIcon(o.name),
+    registeredAt: o.registered_at,
+    detection: e.latest_detection || null,
+    location: e.location || null,
   };
+}
 
-
-  const pageTitle =
-    $("#pageTitle");
-
-
-  if (pageTitle) {
-
-    pageTitle.textContent =
-      titles[page] ||
-      "Dashboard";
-
+async function refreshObjects(showError = true) {
+  try {
+    const data = await api("/objects/status");
+    if (!Array.isArray(data.objects)) throw new Error("Unexpected response from the backend.");
+    objects = data.objects.map(fromEntry);
+  } catch (e) {
+    console.error("Object loading error:", e);
+    if (showError) toast(e.message, true);
   }
+  updateAlertBadge();
+  return objects;
+}
 
+function updateAlertBadge() {
+  const b = $("#alertBadge");
+  if (!b) return;
+  const n = objects.filter(o => !o.detection).length;
+  b.textContent = n;
+  b.style.display = n ? "" : "none";
+}
 
+async function fetchObject(uid) {
+  return fromEntry(await api(`/object/${encodeURIComponent(uid)}`));
+}
+
+async function registerObject(name, uid) {
+  return api("/objects/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nfc_uid: uid, name }),
+  });
+}
+
+// ---------------- MAPS (Leaflet / OpenStreetMap) ----------------
+function destroyMaps() {
+  Object.values(maps).forEach(m => { try { m.remove(); } catch { /* ignore */ } });
+  maps = {};
+}
+
+function initMap(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  if (typeof L === "undefined") {
+    el.innerHTML = '<div class="map-empty">Map library could not be loaded.</div>';
+    return null;
+  }
+  if (maps[id]) return maps[id];
+  const m = L.map(id).setView([20, 0], 2);
+  const tiles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(m);
+  let warned = false;
+  tiles.on("tileerror", () => {
+    if (!warned) { warned = true; toast("Map tiles failed to load", true); }
+  });
+  m.markerLayer = L.layerGroup().addTo(m);
+  maps[id] = m;
+  setTimeout(() => m.invalidateSize(), 60);
+  return m;
+}
+
+function objectPopup(o) {
+  const d = o.detection, l = o.location;
+  return `<b>${esc(o.icon)} ${esc(o.name)}</b><br>Reader ${esc(d.reader_id)}<br>` +
+    `${esc(locParts(l).join(" • ") || "Location details not configured")}<br>` +
+    `${esc(fmtTime(d.timestamp))}<br><small>Marker shows the reader's configured location.</small>`;
+}
+
+// Plots the object's last reader on a map. Returns true if a marker was drawn.
+function plotObject(mapId, o) {
+  const m = initMap(mapId);
+  if (!m) return false;
+  m.markerLayer.clearLayers();
+  const c = o.detection ? coordsOf(o.location) : null;
+  if (!c) { m.setView([20, 0], 2); return false; }
+  m.setView(c, 17);
+  L.circleMarker(c, { radius: 10, color: "#1b3f60", fillColor: "#2a9d8f", fillOpacity: 0.9, weight: 2 })
+    .addTo(m.markerLayer).bindPopup(objectPopup(o)).openPopup();
+  setTimeout(() => m.invalidateSize(), 60);
+  return true;
+}
+
+// ---------------- NAVIGATION ----------------
+const TITLES = {
+  dashboard: "Dashboard", find: "Find Object", voice: "Voice Interaction",
+  objects: "Tagged Objects", history: "Activity History", locations: "Locations", alerts: "Alerts",
+};
+
+async function nav(page) {
+  currentPage = page;
+  document.querySelectorAll(".nav").forEach(b =>
+    b.classList.toggle("active", b.dataset.page === page));
+  setText("pageTitle", TITLES[page] || "Dashboard");
+  await refreshObjects(false);
   render();
-
 }
 
-
-// -----------------------------------------------------
-// NAV BUTTONS
-// -----------------------------------------------------
-
-document
-  .querySelectorAll(".nav")
-  .forEach(
-    button => {
-
-      button.onclick =
-        () =>
-          nav(
-            button.dataset.page
-          );
-
-    }
-  );
-
-
-// -----------------------------------------------------
-// NOTIFICATION BUTTON
-// -----------------------------------------------------
-
-const bell =
-  $("#bell");
-
-if (bell) {
-
-  bell.onclick =
-    () =>
-      toast(
-        "No new notifications"
-      );
-
-}
-
-
-// =====================================================
-// RENDER
-// =====================================================
+document.querySelectorAll(".nav").forEach(b => { b.onclick = () => nav(b.dataset.page); });
+const bell = $("#bell");
+if (bell) bell.onclick = () => toast("No new notifications");
 
 function render() {
-
-  const container =
-    $("#content");
-
-
-  if (!container) {
-    return;
-  }
-
-
-  switch (
-    currentPage
-  ) {
-
-    case "dashboard":
-
-      container.innerHTML =
-        dashboard();
-
-      break;
-
-
-    case "find":
-
-      container.innerHTML =
-        findPage();
-
-      break;
-
-
-    case "voice":
-
-      container.innerHTML =
-        voicePage();
-
-      break;
-
-
-    case "objects":
-
-      container.innerHTML =
-        objectsPage();
-
-      break;
-
-
-    case "history":
-
-      container.innerHTML =
-        historyPage();
-
-      break;
-
-
-    case "locations":
-
-      container.innerHTML =
-        locationsPage();
-
-      break;
-
-
-    case "alerts":
-
-      container.innerHTML =
-        alertsPage();
-
-      break;
-
-
-    default:
-
-      currentPage =
-        "dashboard";
-
-      container.innerHTML =
-        dashboard();
-
-  }
-
-
+  const c = $("#content");
+  if (!c) return;
+  destroyMaps();
+  const pages = {
+    dashboard, find: findPage, voice: voicePage, objects: objectsPage,
+    history: historyPage, locations: locationsPage, alerts: alertsPage,
+  };
+  if (!pages[currentPage]) currentPage = "dashboard";
+  const banner = backendOnline === false
+    ? `<div class="banner">⚠ Cannot reach the backend at ${esc(API_BASE)}. Data below may be missing or out of date.</div>` : "";
+  c.innerHTML = banner + pages[currentPage]();
   bind();
-
-
-  /*
-   * Page-specific asynchronous
-   * data loading.
-   */
-
   hydrateCurrentPage();
-
 }
 
-
-// =====================================================
-// PAGE HYDRATION
-// =====================================================
-
-async function hydrateCurrentPage() {
-
-  switch (
-    currentPage
-  ) {
-
-    case "dashboard":
-
-      await loadDashboardDetections();
-
-      break;
-
-
-    case "objects":
-
-      await loadObjectsPageData();
-
-      break;
-
-
-    case "history":
-
-      await loadInitialHistory();
-
-      break;
-
-
-    case "locations":
-
-      await loadLocationsPageData();
-
-      break;
-
-
-    case "alerts":
-
-      await loadAlertsPageData();
-
-      break;
-
+function hydrateCurrentPage() {
+  switch (currentPage) {
+    case "dashboard": return loadDashboardExtras();
+    case "find":
+      initMap("findMap");
+      if (findUid) return showFind(findUid);
+      return;
+    case "voice":
+      if (voiceUid) fetchObject(voiceUid).then(o => showVoiceResult(o, false)).catch(() => {});
+      return;
+    case "history": return loadInitialHistory();
+    case "locations": return loadLocationsPageData();
   }
-
 }
 
-
-// =====================================================
-// STAT CARD
-// =====================================================
-
-function stat(
-  icon,
-  title,
-  value,
-  sub
-) {
-
-  return `
-
-    <div class="stat">
-
-      <div class="ico">
-        ${icon}
-      </div>
-
-      <div>
-
-        <span>
-          ${title}
-        </span>
-
-        <strong>
-          ${value}
-        </strong>
-
-        <small>
-          ${sub}
-        </small>
-
-      </div>
-
-    </div>
-
-  `;
-
+// ---------------- DASHBOARD ----------------
+function stat(icon, title, value, sub, id = "") {
+  return `<div class="stat"><div class="ico">${icon}</div><div><span>${title}</span>
+    <strong ${id ? `id="${id}"` : ""}>${value}</strong><small>${sub}</small></div></div>`;
 }
-
-
-// =====================================================
-// DASHBOARD
-// =====================================================
 
 function dashboard() {
+  const detected = objects.filter(o => o.detection);
+  const today = detected.filter(o => isToday(o.detection.timestamp)).length;
+  const attention = objects.length - detected.length;
+  const recent = [...detected].sort((a, b) => b.detection.id - a.detection.id);
 
   return `
+  <section class="welcome"><div><h2>Good evening, Caregiver 👋</h2>
+    <p>Find a tagged object and see its last known location.</p></div>
+    <button class="primary" onclick="nav('find')">🔎 Find an object</button></section>
 
-    <section class="welcome">
+  <section class="stats">
+    ${stat("🏷️", "Tagged Objects", objects.length, "Registered NFC objects")}
+    ${stat("✓", "Detected Today", today, "Objects last seen today")}
+    ${stat("⌖", "Locations", "—", "Configured readers", "statLocations")}
+    ${stat("⚠", "Attention Needed", attention, "Objects never detected")}
+  </section>
 
-      <div>
-
-        <h2>
-          Good evening, Caregiver 👋
-        </h2>
-
-        <p>
-          Find a tagged object and see its
-          last known location.
-        </p>
-
+  <div class="grid2">
+    <section class="panel">
+      <div class="panel-head"><div><h3>Recently detected</h3><p>Latest NFC event per object</p></div>
+        <button class="text" onclick="nav('history')">View history →</button></div>
+      <div class="activity">
+        ${recent.length === 0
+          ? `<div style="padding:20px;text-align:center;color:#718096">No NFC detections recorded yet.</div>`
+          : recent.map(o => `
+            <div class="row"><div class="objicon">${o.icon}</div>
+              <div class="grow"><b>${esc(o.name)}</b>
+                <small>Reader ${esc(o.detection.reader_id)} • ${esc(o.id)}</small></div>
+              <time>${esc(fmtTime(o.detection.timestamp))}</time></div>`).join("")}
       </div>
-
-
-      <button
-        class="primary"
-        onclick="nav('find')"
-      >
-        🔎 Find an object
-      </button>
-
     </section>
 
-
-    <section class="stats">
-
-      ${stat(
-        "🏷️",
-        "Tagged Objects",
-        objects.length,
-        "Registered NFC objects"
-      )}
-
-
-      ${stat(
-        "✓",
-        "Detected Today",
-        "—",
-        "Latest detections today"
-      )}
-
-
-      ${stat(
-        "⌖",
-        "Locations",
-        "—",
-        "Active reader locations"
-      )}
-
-
-      ${stat(
-        "⚠",
-        "Attention Needed",
-        "—",
-        "Objects without detection"
-      )}
-
+    <section class="panel">
+      <div class="panel-head"><div><h3>Quick find</h3><p>Select an object to locate it</p></div></div>
+      <div class="quick">
+        ${objects.length === 0
+          ? `<div style="padding:20px;color:#718096">No registered objects.</div>`
+          : objects.slice(0, 5).map(o => `
+            <button data-object="${esc(o.id)}"><span class="objicon">${o.icon}</span>
+              <span class="grow"><b>${esc(o.name)}</b>
+                <small>${o.location ? esc(pre("Room", o.location.room)) : `NFC: ${esc(o.id)}`}</small></span>→</button>`).join("")}
+      </div>
+      <button class="secondary full" id="scan">↻ Refresh detections</button>
     </section>
-
-
-    <div class="grid2">
-
-
-      <!-- ========================================= -->
-      <!-- RECENT ACTIVITY -->
-      <!-- ========================================= -->
-
-      <section class="panel">
-
-        <div class="panel-head">
-
-          <div>
-
-            <h3>
-              Recently detected
-            </h3>
-
-            <p>
-              Latest NFC events
-            </p>
-
-          </div>
-
-
-          <button
-            class="text"
-            onclick="nav('history')"
-          >
-            View history →
-          </button>
-
-        </div>
-
-
-        <div class="activity">
-
-          <div
-            style="
-              padding:20px;
-              text-align:center;
-              color:#718096
-            "
-          >
-            Loading NFC detections...
-          </div>
-
-        </div>
-
-      </section>
-
-
-      <!-- ========================================= -->
-      <!-- QUICK FIND -->
-      <!-- ========================================= -->
-
-      <section class="panel">
-
-        <div class="panel-head">
-
-          <div>
-
-            <h3>
-              Quick find
-            </h3>
-
-            <p>
-              Select an object to locate it
-            </p>
-
-          </div>
-
-        </div>
-
-
-        <div class="quick">
-
-          ${
-            objects.length === 0
-
-              ? `
-
-                <div
-                  style="
-                    padding:20px;
-                    color:#718096
-                  "
-                >
-                  No registered objects.
-                </div>
-
-              `
-
-              :
-
-                objects
-                  .slice(0, 5)
-                  .map(
-                    object => `
-
-                      <button
-                        data-object="${escapeHtml(
-                          object.id
-                        )}"
-                      >
-
-                        <span class="objicon">
-                          ${object.icon}
-                        </span>
-
-
-                        <span class="grow">
-
-                          <b>
-                            ${escapeHtml(
-                              object.name
-                            )}
-                          </b>
-
-                          <small>
-                            ${
-                              object.room !==
-                              "—"
-                                ? escapeHtml(
-                                    object.room
-                                  )
-                                : `NFC: ${escapeHtml(
-                                    object.id
-                                  )}`
-                            }
-                          </small>
-
-                        </span>
-
-
-                        →
-
-                      </button>
-
-                    `
-                  )
-                  .join("")
-
-          }
-
-        </div>
-
-
-        <button
-          class="secondary full"
-          id="scan"
-        >
-          Simulate NFC scan
-        </button>
-
-      </section>
-
-    </div>
-
-
-    <!-- =========================================== -->
-    <!-- SYSTEM WORKFLOW -->
-    <!-- =========================================== -->
-
-    <section class="workflow">
-
-      <div class="step">
-
-        <div class="stepnum">
-          01
-        </div>
-
-        <b>
-          NFC Tag
-        </b>
-
-        <small>
-          Object identity
-        </small>
-
-      </div>
-
-
-      <div class="arrow">
-        →
-      </div>
-
-
-      <div class="step">
-
-        <div class="stepnum">
-          02
-        </div>
-
-        <b>
-          PN532
-        </b>
-
-        <small>
-          Reads tag
-        </small>
-
-      </div>
-
-
-      <div class="arrow">
-        →
-      </div>
-
-
-      <div class="step">
-
-        <div class="stepnum">
-          03
-        </div>
-
-        <b>
-          ESP32
-        </b>
-
-        <small>
-          Sends data
-        </small>
-
-      </div>
-
-
-      <div class="arrow">
-        →
-      </div>
-
-
-      <div class="step">
-
-        <div class="stepnum">
-          04
-        </div>
-
-        <b>
-          Backend
-        </b>
-
-        <small>
-          Stores event
-        </small>
-
-      </div>
-
-
-      <div class="arrow">
-        →
-      </div>
-
-
-      <div class="step">
-
-        <div class="stepnum">
-          05
-        </div>
-
-        <b>
-          Web App
-        </b>
-
-        <small>
-          Caregiver view
-        </small>
-
-      </div>
-
-    </section>
-
-  `;
-
+  </div>
+
+  <section class="workflow">
+    <div class="step"><div class="stepnum">01</div><b>NFC Tag</b><small>Object identity</small></div><div class="arrow">→</div>
+    <div class="step"><div class="stepnum">02</div><b>PN532</b><small>Reads tag</small></div><div class="arrow">→</div>
+    <div class="step"><div class="stepnum">03</div><b>ESP32</b><small>Sends data</small></div><div class="arrow">→</div>
+    <div class="step"><div class="stepnum">04</div><b>Backend</b><small>Stores event</small></div><div class="arrow">→</div>
+    <div class="step"><div class="stepnum">05</div><b>Web App</b><small>Caregiver view</small></div>
+  </section>`;
 }
 
-
-// =====================================================
-// DASHBOARD LIVE DATA
-// =====================================================
-
-async function loadDashboardDetections() {
-
-  if (currentPage !== "dashboard") {
-    return;
-  }
-
-  const results = [];
-
-  // Get the latest detection for every registered object
-  for (const object of objects) {
-
-    const data = await getLatestDetection(object.id);
-
-    if (
-      data &&
-      data.status === "success" &&
-      data.found === true &&
-      data.detection
-    ) {
-
-      results.push({
-        object: object,
-        detection: data.detection
-      });
-    }
-  }
-
-  // Sort newest first
-  results.sort(
-    (a, b) =>
-      new Date(b.detection.timestamp) -
-      new Date(a.detection.timestamp)
-  );
-
-  console.log(
-    "Latest NFC detections:",
-    results
-  );
-
-  const activity =
-    document.querySelector(".activity");
-
-  if (!activity) {
-    return;
-  }
-
-  // Nothing detected yet
-  if (results.length === 0) {
-
-    activity.innerHTML = `
-      <div
-        style="
-          padding:20px;
-          text-align:center;
-          color:#718096
-        "
-      >
-        No NFC detections recorded yet.
-      </div>
-    `;
-
-    return;
-  }
-
-  // Display detections
-  activity.innerHTML = results
-    .map(item => {
-
-      const object = item.object;
-      const detection = item.detection;
-
-      return `
-        <div class="row">
-
-          <div class="objicon">
-            ${object.icon || "🏷️"}
-          </div>
-
-          <div class="grow">
-
-            <b>
-              ${object.name}
-            </b>
-
-            <small>
-              Reader ${detection.reader_id}
-              • ${detection.nfc_uid}
-            </small>
-
-          </div>
-
-          <time>
-            ${formatTimestamp(
-              detection.timestamp
-            )}
-          </time>
-
-        </div>
-      `;
-
-    })
-    .join("");
+async function loadDashboardExtras() {
+  try {
+    const d = await api("/readers");
+    setText("statLocations", Array.isArray(d.readers) ? d.readers.length : "—");
+  } catch { /* offline banner already handled */ }
 }
 
-
-// =====================================================
-// FIND OBJECT PAGE
-// =====================================================
-
+// ---------------- FIND OBJECT ----------------
 function findPage() {
-
   return `
-
-    <div class="find-grid">
-
-
-      <!-- ========================================= -->
-      <!-- SEARCH -->
-      <!-- ========================================= -->
-
-      <section>
-
-        <div class="search">
-
-          <span>
-            ⌕
-          </span>
-
-          <input
-            id="search"
-            placeholder="Enter NFC UID or object name..."
-            value="${
-              escapeHtml(
-                window.findTerm ||
-                ""
-              )
-            }"
-          >
-
+  <div class="find-grid">
+    <section>
+      <div class="search"><span>⌕</span>
+        <input id="search" placeholder="Enter NFC UID or object name..." value="${esc(findTerm)}"></div>
+      <div class="panel" style="margin-top:12px;padding:15px">
+        <div class="panel-head"><div><h3>NFC Object Lookup</h3>
+          <p>Enter an NFC UID or object name to find its last known location.</p></div></div>
+        <button class="primary full" id="lookupNFC">🔎 Find Object</button>
+        <div id="lookupResult" style="margin-top:15px"></div>
+        <div style="margin-top:18px">
+          <p style="font-size:9px;font-weight:700;color:#718096;margin-bottom:8px">REGISTERED OBJECTS</p>
+          ${objects.length === 0 ? "<small>No registered objects.</small>" : objects.map(o => `
+            <button class="secondary full" style="margin-bottom:6px;text-align:left"
+              data-object="${esc(o.id)}">${o.icon} ${esc(o.name)}</button>`).join("")}
         </div>
-
-
-        <div
-          class="panel"
-          style="
-            margin-top:12px;
-            padding:15px
-          "
-        >
-
-          <div class="panel-head">
-
-            <div>
-
-              <h3>
-                NFC Object Lookup
-              </h3>
-
-              <p>
-                Enter an NFC UID or object name
-                to find its last known location.
-              </p>
-
-            </div>
-
-          </div>
-
-
-          <button
-            class="primary full"
-            id="lookupNFC"
-          >
-            🔎 Find Object
-          </button>
-
-
-          <div
-            id="lookupResult"
-            style="
-              margin-top:15px
-            "
-          ></div>
-
-
-          <!-- Registered objects -->
-
-          <div
-            style="
-              margin-top:18px
-            "
-          >
-
-            <p
-              style="
-                font-size:9px;
-                font-weight:700;
-                color:#718096;
-                margin-bottom:8px
-              "
-            >
-              REGISTERED OBJECTS
-            </p>
-
-
-            <div>
-
-              ${
-                objects.length === 0
-
-                  ? `
-                    <small>
-                      No registered objects.
-                    </small>
-                  `
-
-                  :
-
-                    objects
-                      .map(
-                        object => `
-
-                          <button
-                            class="secondary full"
-                            style="
-                              margin-bottom:6px;
-                              text-align:left
-                            "
-                            data-object="${
-                              escapeHtml(
-                                object.id
-                              )
-                            }"
-                          >
-
-                            ${object.icon}
-
-                            ${
-                              escapeHtml(
-                                object.name
-                              )
-                            }
-
-                          </button>
-
-                        `
-                      )
-                      .join("")
-
-              }
-
-            </div>
-
-          </div>
-
-        </div>
-
-      </section>
-
-
-      ${locationCard()}
-
-    </div>
-
-  `;
-
+      </div>
+    </section>
+    ${locationCard()}
+  </div>`;
 }
-
-
-// =====================================================
-// LOCATION CARD
-// =====================================================
 
 function locationCard() {
-
   return `
-
-    <section class="location-card">
-
-
-      <div class="map">
-
-        <span class="pin">
-          ●
-        </span>
-
-        <span
-          class="maplabel"
-          id="mapLabel"
-        >
-          Search for an NFC tag
-        </span>
-
-      </div>
-
-
-      <div class="locbody">
-
-        <span class="label">
-          LAST KNOWN LOCATION
-        </span>
-
-
-        <h2
-          id="locationObject"
-        >
-          🏷️ NFC Tag
-        </h2>
-
-
-        <div class="highlight">
-
-          <span>
-            ⌖
-          </span>
-
-
-          <div>
-
-            <b
-              id="locationRoom"
-            >
-              —
-            </b>
-
-
-            <small
-              id="locationDetails"
-            >
-              Building — • Floor — • Reader —
-            </small>
-
-          </div>
-
-        </div>
-
-
-        <div class="timebox">
-
-          <span>
-            Last detected
-          </span>
-
-
-          <b
-            id="locationTime"
-          >
-            —
-          </b>
-
-
-          <small
-            id="locationUID"
-          >
-            NFC UID: —
-          </small>
-
-        </div>
-
-
-        <button
-          class="primary full"
-          id="route"
-        >
-          📍 Show location
-        </button>
-
-
-        <p
-          style="
-            font-size:8px;
-            color:#9aa5b1;
-            text-align:center
-          "
-        >
-          Location is the most recent NFC
-          detection point.
-        </p>
-
-      </div>
-
-    </section>
-
-  `;
-
+  <section class="location-card">
+    <div class="gis-map" id="findMap"></div>
+    <div class="map-note" id="mapNote">Search for an object to see its last reader on the map.</div>
+    <div class="locbody">
+      <span class="label">LAST KNOWN LOCATION</span>
+      <h2 id="locationObject">🏷️ No object selected</h2>
+      <div class="highlight"><span>⌖</span><div>
+        <b id="locationRoom">—</b>
+        <small id="locationDetails">Building — • Floor — • Reader —</small></div></div>
+      <div class="timebox"><span>Last detected</span><b id="locationTime">—</b>
+        <small id="locationUID">NFC UID: —</small></div>
+      <div class="map-note" id="locationCoords" style="padding-left:0">Coordinates: —</div>
+      <button class="primary full" id="route">📍 Show location</button>
+      <p style="font-size:8px;color:#9aa5b1;text-align:center">
+        The marker is the reader's configured position, not a precise position of the object.</p>
+    </div>
+  </section>`;
 }
 
-
-// =====================================================
-// PERFORM OBJECT LOOKUP
-// =====================================================
-
-async function performLookup(
-  searchValue
-) {
-
-  const value =
-    searchValue
-      .trim();
-
-
-  if (!value) {
-
-    toast(
-      "Enter an NFC UID or object name"
-    );
-
-    return;
-
-  }
-
-
-  const lower =
-    value.toLowerCase();
-
-
-  /*
-   * First search the locally
-   * registered objects.
-   */
-
-  let object =
-    objects.find(
-      item =>
-        item.id.toUpperCase() ===
-        value.toUpperCase()
-    );
-
-
-  /*
-   * If not a UID, search by name.
-   */
-
-  if (!object) {
-
-    object =
-      objects.find(
-        item =>
-          item.name
-            .toLowerCase()
-            .includes(lower)
-      );
-
-  }
-
-
-  /*
-   * If object doesn't exist in
-   * registration database, still
-   * allow UID lookup against
-   * the detection endpoint.
-   */
-
-  const uid =
-    object
-      ? object.id
-      : value.toUpperCase();
-
-
-  const result =
-    $("#lookupResult");
-
-
-  if (result) {
-
-    result.innerHTML = `
-
-      <p
-        style="
-          color:#718096;
-          font-size:10px
-        "
-      >
-        Searching...
-      </p>
-
-    `;
-
-  }
-
-
-  const detection =
-    await getLatestDetection(
-      uid,
-      true
-    );
-
-
-  if (
-    !detection
-  ) {
-
-    if (result) {
-
-      result.innerHTML = `
-
-        <p
-          style="
-            color:#c05621;
-            font-size:10px
-          "
-        >
-          No detection found for this NFC tag.
-        </p>
-
-      `;
-
-    }
-
-    clearLocationCard();
-
-    return;
-
-  }
-
-
-  /*
-   * Resolve reader location.
-   */
-
-  const location =
-    await getReaderLocation(
-      detection.reader_id,
-      true
-    );
-
-
-  /*
-   * Display lookup result.
-   */
-
-  if (result) {
-
-    result.innerHTML = `
-
-      <div class="highlight">
-
-        <span>
-          ${
-            object
-              ? object.icon
-              : "🏷️"
-          }
-        </span>
-
-
-        <div>
-
-          <b>
-            ${
-              object
-                ? escapeHtml(
-                    object.name
-                  )
-                : "NFC Tag Detected"
-            }
-          </b>
-
-
-          <small>
-            UID:
-            ${escapeHtml(
-              detection.nfc_uid
-            )}
-          </small>
-
-        </div>
-
-      </div>
-
-
-      <div
-        class="timebox"
-        style="
-          margin-top:10px
-        "
-      >
-
-        <span>
-          Last detected by
-        </span>
-
-
-        <b>
-          Reader
-          ${escapeHtml(
-            detection.reader_id
-          )}
-        </b>
-
-
-        <small>
-          ${formatTimestamp(
-            detection.timestamp
-          )}
-        </small>
-
-      </div>
-
-    `;
-
-  }
-
-
-  /*
-   * Update location card.
-   */
-
-  updateLocationCard(
-    object,
-    detection,
-    location
-  );
-
+function chooserHtml(matches) {
+  return `<p style="font-size:10px;color:#718096;margin-bottom:6px">Several objects match. Please choose one:</p>` +
+    matches.map(m => `<button class="secondary full" style="margin-bottom:6px;text-align:left"
+      data-pick="${esc(m.object.nfc_uid)}">${getObjectIcon(m.object.name)} ${esc(m.object.name)}
+      <small>${esc(m.object.nfc_uid)}</small></button>`).join("");
 }
 
+function bindPicks(root, fn) {
+  root.querySelectorAll("[data-pick]").forEach(b => { b.onclick = () => fn(b.dataset.pick); });
+}
 
-// =====================================================
-// UPDATE LOCATION CARD
-// =====================================================
-
-function updateLocationCard(
-  object,
-  detection,
-  location
-) {
-
-  const mapLabel =
-    $("#mapLabel");
-
-  const locationObject =
-    $("#locationObject");
-
-  const locationRoom =
-    $("#locationRoom");
-
-  const locationDetails =
-    $("#locationDetails");
-
-  const locationTime =
-    $("#locationTime");
-
-  const locationUID =
-    $("#locationUID");
-
-
-  const icon =
-    object
-      ? object.icon
-      : "🏷️";
-
-
-  const name =
-    object
-      ? object.name
-      : "NFC Tag";
-
-
-  if (
-    mapLabel
-  ) {
-
-    mapLabel.textContent =
-      location
-        ? `${location.room} • ${location.reader_id}`
-        : `Reader ${detection.reader_id}`;
-
-  }
-
-
-  if (
-    locationObject
-  ) {
-
-    locationObject.textContent =
-      `${icon} ${name}`;
-
-  }
-
-
-  if (
-    location
-  ) {
-
-    if (
-      locationRoom
-    ) {
-
-      locationRoom.textContent =
-        location.room ||
-        "Unknown room";
-
+async function performLookup(value) {
+  const v = (value || "").trim();
+  const box = $("#lookupResult");
+  if (!box) return;
+  if (!v) { toast("Enter an NFC UID or object name", true); return; }
+  findTerm = v;
+  box.innerHTML = loadingBox("Searching...");
+  try {
+    const d = await api(`/objects/search?q=${encodeURIComponent(v)}`);
+    const m = Array.isArray(d.matches) ? d.matches : [];
+    if (m.length === 0) {
+      box.innerHTML = errBox(`No registered object or NFC UID matches “${v}”.`);
+      findUid = null;
+      clearLocationCard();
+    } else if (m.length > 1) {
+      box.innerHTML = chooserHtml(m);
+      bindPicks(box, uid => showFind(uid));
+    } else {
+      findUid = m[0].object.nfc_uid;
+      renderFindResult(fromEntry(m[0]));
     }
+  } catch (e) {
+    box.innerHTML = errBox(e.message);
+  }
+}
 
+async function showFind(uid) {
+  findUid = uid;
+  const box = $("#lookupResult");
+  if (!box) return;
+  try {
+    renderFindResult(await fetchObject(uid));
+  } catch (e) {
+    box.innerHTML = errBox(e.message);
+  }
+}
 
-    if (
-      locationDetails
-    ) {
+function renderFindResult(o) {
+  const box = $("#lookupResult");
+  if (box) {
+    const d = o.detection;
+    box.innerHTML = `
+      <div class="highlight"><span>${o.icon}</span><div><b>${esc(o.name)}</b>
+        <small>UID: ${esc(o.id)}</small></div></div>
+      <div class="timebox" style="margin-top:10px">
+        ${d ? `<span>Last detected by</span><b>Reader ${esc(d.reader_id)}</b>
+               <small>${esc(fmtTime(d.timestamp))}${d.id != null ? ` • detection #${esc(d.id)}` : ""}</small>`
+            : `<span>Status</span><b>Not detected yet</b><small>No reader has recorded this tag.</small>`}
+      </div>`;
+  }
+  updateLocationCard(o);
+}
 
-      locationDetails.textContent =
-        `${location.building || "—"} • ${
-          location.floor || "—"
-        } • Reader ${
-          location.reader_id ||
-          detection.reader_id
-        }`;
+function updateLocationCard(o) {
+  const d = o.detection, l = o.location;
+  findCoords = null;
+  setText("locationObject", `${o.icon} ${o.name}`);
+  setText("locationUID", `NFC UID: ${o.id}`);
 
-    }
-
+  if (!d) {
+    setText("locationRoom", "Not detected yet");
+    setText("locationDetails", "No reader has detected this tag.");
+    setText("locationTime", "—");
   } else {
-
-    if (
-      locationRoom
-    ) {
-
-      locationRoom.textContent =
-        "Location unavailable";
-
+    setText("locationTime", fmtTime(d.timestamp));
+    if (!l) {
+      setText("locationRoom", "Location not configured");
+      setText("locationDetails", `Reader ${d.reader_id} has no configured building, floor or room`);
+    } else {
+      setText("locationRoom", l.room ? pre("Room", l.room) : "Room not set");
+      setText("locationDetails",
+        `${l.building || "Building not set"} • ${l.floor ? pre("Floor", l.floor) : "Floor not set"} • Reader ${l.reader_id}`);
     }
-
-
-    if (
-      locationDetails
-    ) {
-
-      locationDetails.textContent =
-        `Reader ${detection.reader_id}`;
-
-    }
-
   }
 
-
-  if (
-    locationTime
-  ) {
-
-    locationTime.textContent =
-      formatTimestamp(
-        detection.timestamp
-      );
-
+  const c = d ? coordsOf(l) : null;
+  findCoords = c;
+  const cEl = $("#locationCoords");
+  if (cEl) {
+    cEl.innerHTML = c
+      ? `Latitude ${c[0]}, Longitude ${c[1]} • ${osmLink(c)}`
+      : d ? "GPS coordinates not configured" : "Coordinates: —";
   }
-
-
-  if (
-    locationUID
-  ) {
-
-    locationUID.textContent =
-      `NFC UID: ${detection.nfc_uid}`;
-
-  }
-
+  const plotted = plotObject("findMap", o);
+  setText("mapNote", plotted
+    ? "Marker = the reader's configured location, not necessarily the object's exact position."
+    : d ? "GPS coordinates not configured for this reader, so no marker is shown."
+        : "Not detected yet, so there is nothing to show on the map.");
 }
-
-
-// =====================================================
-// CLEAR LOCATION CARD
-// =====================================================
 
 function clearLocationCard() {
-
-  const elements = {
-
-    mapLabel:
-      "Search for an NFC tag",
-
-    locationObject:
-      "🏷️ NFC Tag",
-
-    locationRoom:
-      "—",
-
-    locationDetails:
-      "Building — • Floor — • Reader —",
-
-    locationTime:
-      "—",
-
-    locationUID:
-      "NFC UID: —"
-
-  };
-
-
-  Object.entries(
-    elements
-  ).forEach(
-    ([id, value]) => {
-
-      const element =
-        $(`#${id}`);
-
-      if (element) {
-
-        element.textContent =
-          value;
-
-      }
-
-    }
-  );
-
+  setText("locationObject", "🏷️ No object selected");
+  setText("locationRoom", "—");
+  setText("locationDetails", "Building — • Floor — • Reader —");
+  setText("locationTime", "—");
+  setText("locationUID", "NFC UID: —");
+  setText("mapNote", "Search for an object to see its last reader on the map.");
+  const c = $("#locationCoords");
+  if (c) c.textContent = "Coordinates: —";
+  findCoords = null;
+  const m = maps.findMap;
+  if (m) { m.markerLayer.clearLayers(); m.setView([20, 0], 2); }
 }
 
-
-// =====================================================
-// OBJECTS PAGE
-// =====================================================
-
+// ---------------- TAGGED OBJECTS ----------------
 function objectsPage() {
-
   return `
-
-    <div class="intro">
-
-
-      <div>
-
-        <h2>
-          Tagged Objects
-        </h2>
-
-        <p>
-          Registered NFC stickers and their
-          last detection details.
-        </p>
-
-      </div>
-
-
-      <button
-        class="primary"
-        id="addObjectBtn"
-      >
-        ＋ Add object
-      </button>
-
-    </div>
-
-
-    <section class="table">
-
-
-      <div class="thead">
-
-        <span>
-          Object
-        </span>
-
-        <span>
-          NFC ID
-        </span>
-
-        <span>
-          Location
-        </span>
-
-        <span>
-          Last detected
-        </span>
-
-        <span>
-          Status
-        </span>
-
-      </div>
-
-
-      ${
-        objects.length === 0
-
-          ? `
-
-            <div
-              style="
-                padding:25px;
-                text-align:center;
-                color:#718096
-              "
-            >
-
-              No registered objects.
-
-            </div>
-
-          `
-
-          :
-
-            objects
-              .map(
-                object => `
-
-                  <div class="tr">
-
-                    <span>
-
-                      <b>
-                        ${object.icon}
-
-                        ${escapeHtml(
-                          object.name
-                        )}
-                      </b>
-
-                    </span>
-
-
-                    <span>
-
-                      ${escapeHtml(
-                        object.id
-                      )}
-
-                    </span>
-
-
-                    <span>
-
-                      ${
-                        object.building !==
-                        "—"
-
-                          ? `
-                            ${escapeHtml(
-                              object.building
-                            )},
-                            ${escapeHtml(
-                              object.floor
-                            )}
-
-                            <small>
-                              ${escapeHtml(
-                                object.room
-                              )}
-                              •
-                              ${escapeHtml(
-                                object.reader
-                              )}
-                            </small>
-                          `
-
-                          : `
-                            Not detected yet
-                          `
-                      }
-
-                    </span>
-
-
-                    <span>
-
-                      ${escapeHtml(
-                        object.time
-                      )}
-
-                    </span>
-
-
-                    <span
-                      class="${
-                        object.status ===
-                        "Detected"
-                          ? "success"
-                          : "warning"
-                      }"
-                    >
-
-                      ${escapeHtml(
-                        object.status
-                      )}
-
-                    </span>
-
-                  </div>
-
-                `
-              )
-              .join("")
-
-      }
-
-    </section>
-
-  `;
-
+  <div class="intro"><div><h2>Tagged Objects</h2>
+    <p>Registered NFC stickers and their last detection details.</p></div>
+    <button class="primary" id="addObjectBtn">＋ Add object</button></div>
+  <section class="table">
+    <div class="thead"><span>Object</span><span>NFC ID</span><span>Location</span>
+      <span>Last detected</span><span>Status</span></div>
+    ${objects.length === 0
+      ? `<div style="padding:25px;text-align:center;color:#718096">No registered objects.</div>`
+      : objects.map(o => {
+          const d = o.detection, l = o.location;
+          const loc = !d ? "Not detected yet"
+            : !l ? `Reader ${esc(d.reader_id)} <small>location not configured</small>`
+            : `${esc(l.building)}, ${esc(pre("Floor", l.floor))}
+               <small>${esc(pre("Room", l.room))} • ${esc(l.reader_id)}</small>`;
+          return `<div class="tr">
+            <span><b>${o.icon} ${esc(o.name)}</b></span>
+            <span>${esc(o.id)}</span>
+            <span>${loc}</span>
+            <span>${d ? esc(fmtTime(d.timestamp)) : "—"}</span>
+            <span class="${d ? "success" : "warning"}">${d ? "Detected" : "Not detected"}</span></div>`;
+        }).join("")}
+  </section>`;
 }
-
-
-// =====================================================
-// OBJECTS PAGE LIVE DATA
-// =====================================================
-
-async function loadObjectsPageData() {
-
-  if (
-    currentPage !==
-    "objects"
-  ) {
-    return;
-  }
-
-
-  await updateObjectDetectionInfo();
-
-
-  /*
-   * Re-render the table with
-   * updated location information.
-   *
-   * Do not call render(), because
-   * that would bind everything again.
-   */
-
-  const container =
-    $("#content");
-
-
-  if (
-    container
-  ) {
-
-    container.innerHTML =
-      objectsPage();
-
-    bind();
-
-  }
-
-}
-
-
-// =====================================================
-// ADD OBJECT MODAL
-// =====================================================
 
 function showAddObjectForm() {
-
-  const existing =
-    $("#addObjectModal");
-
-
-  if (existing) {
-
-    existing.remove();
-
-  }
-
-
-  document.body.insertAdjacentHTML(
-    "beforeend",
-    `
-
-      <div
-        id="addObjectModal"
-        style="
-          position:fixed;
-          inset:0;
-          background:rgba(0,0,0,.35);
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          z-index:9999;
-        "
-      >
-
-        <div
-          style="
-            background:white;
-            width:400px;
-            max-width:90%;
-            border-radius:14px;
-            padding:24px;
-            box-shadow:
-              0 20px 50px
-              rgba(0,0,0,.2);
-          "
-        >
-
-          <h2
-            style="
-              margin-bottom:6px;
-            "
-          >
-            Add Tagged Object
-          </h2>
-
-
-          <p
-            style="
-              color:#718096;
-              font-size:10px;
-              margin-bottom:20px;
-            "
-          >
-            Register an NFC sticker with an
-            everyday object.
-          </p>
-
-
-          <!-- OBJECT NAME -->
-
-          <label
-            style="
-              display:block;
-              font-size:11px;
-              font-weight:600;
-              margin-bottom:6px;
-            "
-          >
-            Object Name
-          </label>
-
-
-          <input
-            id="newObjectName"
-            type="text"
-            placeholder="e.g. House Keys"
-            autocomplete="off"
-            style="
-              width:100%;
-              padding:11px;
-              border:
-                1px solid #d9e1e8;
-              border-radius:8px;
-              margin-bottom:15px;
-              box-sizing:border-box;
-            "
-          />
-
-
-          <!-- NFC UID -->
-
-          <label
-            style="
-              display:block;
-              font-size:11px;
-              font-weight:600;
-              margin-bottom:6px;
-            "
-          >
-            NFC UID
-          </label>
-
-
-          <input
-            id="newObjectUID"
-            type="text"
-            placeholder="e.g. 53090BF5130001"
-            autocomplete="off"
-            style="
-              width:100%;
-              padding:11px;
-              border:
-                1px solid #d9e1e8;
-              border-radius:8px;
-              margin-bottom:8px;
-              box-sizing:border-box;
-              text-transform:uppercase;
-            "
-          />
-
-
-          <small
-            style="
-              display:block;
-              color:#718096;
-              font-size:9px;
-              margin-bottom:20px;
-            "
-          >
-            The UID must match the UID printed/read
-            from the NFC tag.
-          </small>
-
-
-          <!-- BUTTONS -->
-
-          <div
-            style="
-              display:flex;
-              gap:10px;
-            "
-          >
-
-            <button
-              id="cancelAddObject"
-              class="secondary"
-              style="
-                flex:1;
-              "
-            >
-              Cancel
-            </button>
-
-
-            <button
-              id="saveObject"
-              class="primary"
-              style="
-                flex:1;
-              "
-            >
-              Save Object
-            </button>
-
-          </div>
-
-        </div>
-
-      </div>
-
-    `
-  );
-
-
-  /*
-   * Cancel
-   */
-
-  const cancel =
-    $("#cancelAddObject");
-
-
-  if (cancel) {
-
-    cancel.onclick =
-      () => {
-
-        $("#addObjectModal")
-          ?.remove();
-
-      };
-
-  }
-
-
-  /*
-   * Save
-   */
-
-  const save =
-    $("#saveObject");
-
-
-  if (save) {
-
-    save.onclick =
-      registerNewObject;
-
-  }
-
-
-  /*
-   * Allow Enter key.
-   */
-
-  const nameInput =
-    $("#newObjectName");
-
-  const uidInput =
-    $("#newObjectUID");
-
-
-  [nameInput, uidInput]
-    .forEach(input => {
-
-      if (!input) {
-        return;
-      }
-
-      input.addEventListener(
-        "keydown",
-        event => {
-
-          if (
-            event.key ===
-            "Enter"
-          ) {
-
-            registerNewObject();
-
-          }
-
-        }
-      );
-
-    });
-
-
-  /*
-   * Focus object name.
-   */
-
-  if (nameInput) {
-
-    setTimeout(
-      () =>
-        nameInput.focus(),
-      50
-    );
-
-  }
-
+  $("#addObjectModal")?.remove();
+  document.body.insertAdjacentHTML("beforeend", `
+  <div id="addObjectModal" class="modal-back"><div class="modal-box">
+    <h2 style="margin-bottom:6px">Add Tagged Object</h2>
+    <p style="color:#718096;font-size:10px;margin-bottom:20px">Register an NFC sticker with an everyday object.</p>
+    <label>Object Name</label>
+    <input id="newObjectName" type="text" placeholder="e.g. House Keys" autocomplete="off">
+    <label>NFC UID</label>
+    <input id="newObjectUID" type="text" placeholder="e.g. 53090BF5130001" autocomplete="off"
+           style="text-transform:uppercase;margin-bottom:8px">
+    <small style="display:block;color:#718096;font-size:9px;margin-bottom:20px">
+      The UID must match the UID read from the NFC tag.</small>
+    <div class="btns"><button id="cancelAddObject" class="secondary">Cancel</button>
+      <button id="saveObject" class="primary">Save Object</button></div>
+  </div></div>`);
+  $("#cancelAddObject").onclick = () => $("#addObjectModal")?.remove();
+  $("#saveObject").onclick = registerNewObject;
+  ["#newObjectName", "#newObjectUID"].forEach(s =>
+    $(s).addEventListener("keydown", e => { if (e.key === "Enter") registerNewObject(); }));
+  setTimeout(() => $("#newObjectName")?.focus(), 50);
 }
-
-
-// =====================================================
-// REGISTER NEW OBJECT FROM UI
-// =====================================================
 
 async function registerNewObject() {
+  const nameInput = $("#newObjectName"), uidInput = $("#newObjectUID");
+  if (!nameInput || !uidInput) return;
+  const name = nameInput.value.trim();
+  const uid = uidInput.value.trim().toUpperCase();
 
-  const nameInput =
-    $("#newObjectName");
+  if (!name) { toast("Enter an object name", true); nameInput.focus(); return; }
+  if (!uid) { toast("Enter the NFC UID", true); uidInput.focus(); return; }
+  if (!/^[0-9A-F]+$/.test(uid)) { toast("NFC UID must contain only 0-9 and A-F", true); uidInput.focus(); return; }
 
-  const uidInput =
-    $("#newObjectUID");
+  const existing = objects.find(o => o.id === uid);
+  if (existing && !confirm(`${existing.name} is already registered with this UID.\n\nReplace its name with "${name}"?`)) return;
 
-
-  if (
-    !nameInput ||
-    !uidInput
-  ) {
-    return;
-  }
-
-
-  const name =
-    nameInput.value.trim();
-
-
-  const uid =
-    uidInput.value
-      .trim()
-      .toUpperCase();
-
-
-  /*
-   * Validate name.
-   */
-
-  if (!name) {
-
-    toast(
-      "Enter an object name"
-    );
-
-    nameInput.focus();
-
-    return;
-
-  }
-
-
-  /*
-   * Validate UID.
-   */
-
-  if (!uid) {
-
-    toast(
-      "Enter the NFC UID"
-    );
-
-    uidInput.focus();
-
-    return;
-
-  }
-
-
-  /*
-   * NFC UIDs returned by
-   * the PN532 are hexadecimal.
-   */
-
-  if (
-    !/^[0-9A-F]+$/i.test(
-      uid
-    )
-  ) {
-
-    toast(
-      "NFC UID must contain only 0-9 and A-F"
-    );
-
-    uidInput.focus();
-
-    return;
-
-  }
-
-
-  /*
-   * Check duplicate locally.
-   */
-
-  const existing =
-    getObject(uid);
-
-
-  if (existing) {
-
-    const replace =
-      confirm(
-        `${existing.name} is already registered with this UID.\n\nReplace its name with "${name}"?`
-      );
-
-
-    if (!replace) {
-      return;
-    }
-
-  }
-
-
-  const saveButton =
-    $("#saveObject");
-
-
-  if (saveButton) {
-
-    saveButton.disabled =
-      true;
-
-    saveButton.textContent =
-      "Saving...";
-
-  }
-
-
+  const btn = $("#saveObject");
+  if (btn) { btn.disabled = true; btn.textContent = "Saving..."; }
   try {
-
-    await registerObject(
-      name,
-      uid
-    );
-
-
-    /*
-     * Reload backend data.
-     */
-
-    await refreshObjects(
-      false
-    );
-
-
-    /*
-     * Close modal.
-     */
-
-    $("#addObjectModal")
-      ?.remove();
-
-
-    /*
-     * Update detection information.
-     */
-
-    await updateObjectDetectionInfo();
-
-
-    /*
-     * Refresh page.
-     */
-
+    await registerObject(name, uid);
+    $("#addObjectModal")?.remove();
+    await refreshObjects(false);
     render();
-
-
-    toast(
-      `${name} registered successfully`
-    );
-
-
-  } catch (error) {
-
-    console.error(
-      "Registration error:",
-      error
-    );
-
-
-    toast(
-      error.message ||
-      "Could not register object"
-    );
-
-
-    if (saveButton) {
-
-      saveButton.disabled =
-        false;
-
-      saveButton.textContent =
-        "Save Object";
-
-    }
-
+    toast(`${name} registered successfully`);
+  } catch (e) {
+    toast(e.message || "Could not register object", true);
+    if (btn) { btn.disabled = false; btn.textContent = "Save Object"; }
   }
-
 }
 
-
-// =====================================================
-// HISTORY PAGE
-// =====================================================
-
+// ---------------- ACTIVITY HISTORY ----------------
 function historyPage() {
-
   return `
-
-    <div class="intro">
-
-
-      <div>
-
-        <h2>
-          Activity History
-        </h2>
-
-        <p>
-          Real NFC detection events from
-          the backend.
-        </p>
-
-      </div>
-
-
-      <select
-        id="historyTag"
-        class="secondary"
-      >
-
-        ${
-          objects.length === 0
-
-            ? `
-
-              <option value="">
-                No objects registered
-              </option>
-
-            `
-
-            :
-
-              objects
-                .map(
-                  object => `
-
-                    <option
-                      value="${escapeHtml(
-                        object.id
-                      )}"
-                      ${
-                        selected &&
-                        selected.id ===
-                          object.id
-                          ? "selected"
-                          : ""
-                      }
-                    >
-
-                      ${escapeHtml(
-                        object.name
-                      )}
-
-                      —
-                      ${escapeHtml(
-                        object.id
-                      )}
-
-                    </option>
-
-                  `
-                )
-                .join("")
-
-        }
-
-      </select>
-
-    </div>
-
-
-    <section
-      class="table timeline"
-    >
-
-      <div
-        id="historyResults"
-        style="
-          padding:20px;
-          text-align:center;
-          color:#718096
-        "
-      >
-        Loading detection history...
-      </div>
-
-    </section>
-
-  `;
-
+  <div class="intro"><div><h2>Activity History</h2><p>Real NFC detection events from the backend.</p></div>
+    <select id="historyTag" class="secondary">
+      ${objects.length === 0 ? `<option value="">No objects registered</option>`
+        : objects.map(o => `<option value="${esc(o.id)}" ${o.id === historyUid ? "selected" : ""}>
+            ${esc(o.name)} — ${esc(o.id)}</option>`).join("")}
+    </select></div>
+  <section class="table timeline">
+    <div id="historyResults" style="padding:20px;text-align:center;color:#718096">Loading detection history...</div>
+  </section>`;
 }
 
-
-// =====================================================
-// INITIAL HISTORY
-// =====================================================
+let historyUid = null;
 
 async function loadInitialHistory() {
-
-  if (
-    currentPage !==
-    "history"
-  ) {
+  const select = $("#historyTag");
+  if (!select || !select.value) {
+    const r = $("#historyResults");
+    if (r) r.textContent = "No registered objects.";
     return;
   }
-
-
-  const select =
-    $("#historyTag");
-
-
-  if (!select ||
-      !select.value) {
-
-    return;
-
-  }
-
-
-  await loadHistory(
-    select.value
-  );
-
+  historyUid = select.value;
+  await loadHistory(select.value);
 }
 
-
-// =====================================================
-// LOAD HISTORY
-// =====================================================
-
-async function loadHistory(
-  uid
-) {
-
-  const container =
-    $("#historyResults");
-
-
-  if (
-    !container ||
-    !uid
-  ) {
-    return;
-  }
-
-
-  container.innerHTML = `
-
-    <div
-      style="
-        padding:20px;
-        text-align:center;
-        color:#718096
-      "
-    >
-      Loading...
-    </div>
-
-  `;
-
-
+async function loadHistory(uid) {
+  const box = $("#historyResults");
+  if (!box || !uid) return;
+  historyUid = uid;
   try {
-
-    const response =
-      await fetch(
-        `${API_BASE}/object/${encodeURIComponent(uid)}/history`
-      );
-
-
-    if (!response.ok) {
-
-      throw new Error(
-        "History request failed"
-      );
-
-    }
-
-
-    const data =
-      await response.json();
-
-
-    if (
-      data.status !==
-      "success" ||
-      !data.history ||
-      data.history.length === 0
-    ) {
-
-      container.innerHTML = `
-
-        <p
-          style="
-            padding:20px;
-            color:#718096
-          "
-        >
-          No detection history found.
-        </p>
-
-      `;
-
+    const d = await api(`/object/${encodeURIComponent(uid)}/history`);
+    const hist = Array.isArray(d.history) ? d.history : [];
+    if (hist.length === 0) {
+      box.innerHTML = `<p style="padding:20px;color:#718096">No detection history found.</p>`;
       return;
-
     }
-
-
-    const object =
-      getObject(uid);
-
-
-    container.innerHTML =
-      data.history
-        .map(
-          event => `
-
-            <div class="tr">
-
-
-              <span>
-
-                ${formatTimestamp(
-                  event.timestamp
-                )}
-
-              </span>
-
-
-              <span class="dot"></span>
-
-
-              <span>
-
-                <b>
-
-                  ${
-                    object
-                      ? escapeHtml(
-                          object.name
-                        )
-                      : "NFC Object"
-                  }
-
-                </b>
-
-
-                <small>
-
-                  Reader
-                  ${escapeHtml(
-                    event.reader_id
-                  )}
-
-                  •
-                  ${escapeHtml(
-                    event.nfc_uid
-                  )}
-
-                </small>
-
-              </span>
-
-
-            </div>
-
-          `
-        )
-        .join("");
-
-
-  } catch (error) {
-
-    console.error(
-      "History error:",
-      error
-    );
-
-
-    container.innerHTML = `
-
-      <p
-        style="
-          padding:20px;
-          color:#c05621
-        "
-      >
-        Could not load detection history.
-      </p>
-
-    `;
-
+    const o = objects.find(x => x.id === uid);
+    box.innerHTML = hist.map(ev => `
+      <div class="tr"><span>${esc(fmtTime(ev.timestamp))}</span><span class="dot"></span>
+        <span><b>${o ? esc(o.name) : "NFC Object"}</b>
+          <small>Reader ${esc(ev.reader_id)} • ${esc(ev.nfc_uid)}</small></span></div>`).join("");
+  } catch (e) {
+    box.innerHTML = `<p style="padding:20px;color:#c05621">${esc(e.message)}</p>`;
   }
-
 }
 
-
-// =====================================================
-// LOCATIONS PAGE
-// =====================================================
-
+// ---------------- LOCATIONS ----------------
 function locationsPage() {
-
   return `
+  <div class="intro"><div><h2>Location Hierarchy</h2>
+    <p>Building → Floor → Room → Reader → Objects last seen there.</p></div></div>
 
-    <div class="intro">
+  <section class="panel" style="padding:15px">
+    <div class="panel-head"><div><h3 id="formTitle">Configure reader location</h3>
+      <p>Logical location (building / floor / room) and optional GPS coordinates for the map.</p></div></div>
+    <form id="readerForm" class="reader-form" autocomplete="off">
+      <div><label>READER ID</label><input id="fReader" placeholder="R01" required></div>
+      <div><label>BUILDING</label><input id="fBuilding" placeholder="Building A" required></div>
+      <div><label>FLOOR</label><input id="fFloor" placeholder="Floor 1" required></div>
+      <div><label>ROOM</label><input id="fRoom" placeholder="Room 101" required></div>
+      <div><label>LATITUDE (optional)</label><input id="fLat" placeholder="10.5276" inputmode="decimal"></div>
+      <div><label>LONGITUDE (optional)</label><input id="fLng" placeholder="76.2144" inputmode="decimal"></div>
+      <div class="actions"><button type="submit" class="primary" id="fSave">Save reader</button>
+        <button type="button" class="secondary" id="fReset">Clear form</button></div>
+    </form>
+    <p id="formMsg" class="map-note" style="padding-left:0"></p>
+  </section>
 
-      <div>
-
-        <h2>
-          Location Hierarchy
-        </h2>
-
-        <p>
-          Objects are located through the
-          reader that last detected them.
-        </p>
-
-      </div>
-
-    </div>
-
-
-    <section
-      class="location-hierarchy"
-      id="locationHierarchy"
-    >
-
-      <div
-        style="
-          padding:20px;
-          text-align:center;
-          color:#718096
-        "
-      >
-        Loading reader locations...
-      </div>
-
+  <div class="loc-grid">
+    <section class="panel" style="padding:12px">
+      <div class="panel-head"><div><h3>Reader map</h3><p>Only readers with valid coordinates</p></div></div>
+      <div class="gis-map" id="locMap" style="border-radius:10px"></div>
+      <div class="map-note" id="locMapNote" style="padding-left:0">Loading…</div>
     </section>
+    <section class="location-hierarchy" id="locationHierarchy">
+      <div style="padding:20px;text-align:center;color:#718096">Loading reader locations...</div>
+    </section>
+  </div>
 
-
-    <div
-      class="panel"
-      style="
-        margin-top:15px
-      "
-    >
-
-      <h3>
-        How location tracking works
-      </h3>
-
-      <p
-        style="
-          font-size:10px;
-          color:#718096;
-          line-height:1.6
-        "
-      >
-
-        When an NFC tag is detected,
-        the ESP32 sends the tag UID and
-        reader ID to the backend.
-
-        The backend then maps the reader
-        to its configured Building, Floor
-        and Room.
-
-        The caregiver sees the object's
-        last known location.
-
-      </p>
-
-    </div>
-
-  `;
-
+  <div class="panel" style="margin-top:15px"><h3>How location tracking works</h3>
+    <p style="font-size:10px;color:#718096;line-height:1.6">
+      When an NFC tag is detected, the ESP32 sends the tag UID and reader ID to the backend, which maps the
+      reader to its configured building, floor and room. The <b>logical location</b> (building/floor/room) and the
+      <b>geographic location</b> (latitude/longitude) are stored separately. Map markers show where a
+      <i>reader</i> is, not an exact indoor position for the object.</p></div>`;
 }
 
+function readerHtml(r) {
+  const c = coordsOf(r), last = r.last_detection;
+  return `
+  <details class="hn reader" id="reader-${rid(r.reader_id)}">
+    <summary>📡 <b>Reader ${esc(r.reader_id)}</b>
+      <span class="pill ${last ? "ok" : ""}">${r.total_detections} detection${r.total_detections === 1 ? "" : "s"}</span></summary>
+    <div class="hbody">
+      <div>Coordinates: ${c ? `${c[0]}, ${c[1]} • ${osmLink(c)}` : "GPS coordinates not configured"}</div>
+      <div>Last detection: ${last ? `${esc(fmtTime(last.timestamp))} — ${esc(last.name || last.nfc_uid)}` : "No detections recorded yet."}</div>
+      <div>Objects last seen here:</div>
+      ${r.objects.length
+        ? `<ul>${r.objects.map(o => `<li>${getObjectIcon(o.name)} ${esc(o.name)} <small>• ${esc(fmtTime(o.timestamp))}</small></li>`).join("")}</ul>`
+        : `<small>${last ? "No object currently has this as its latest reader." : "No detections recorded yet."}</small>`}
+      <div style="margin-top:8px"><button class="secondary" data-edit-reader="${esc(r.reader_id)}">Edit location</button></div>
+    </div>
+  </details>`;
+}
 
-// =====================================================
-// LOAD LOCATION PAGE DATA
-// =====================================================
+function hierarchyHtml(d) {
+  if (!d.buildings || d.buildings.length === 0) {
+    return `<div style="padding:25px;text-align:center;color:#718096">
+      No reader locations configured yet. Use the form above to add one.</div>`;
+  }
+  let h = d.buildings.map(b => `
+    <details class="hn" open><summary>🏢 <b>${esc(b.building)}</b></summary><div class="hbody">
+      ${b.floors.map(f => `
+        <details class="hn" open><summary>▤ ${esc(pre("Floor", f.floor))}</summary><div class="hbody">
+          ${f.rooms.map(rm => `
+            <details class="hn" open><summary>🚪 ${esc(pre("Room", rm.room))}</summary><div class="hbody">
+              ${rm.readers.map(readerHtml).join("")}</div></details>`).join("")}
+        </div></details>`).join("")}
+    </div></details>`).join("");
+
+  if (d.undetected_objects && d.undetected_objects.length) {
+    h += `<details class="hn"><summary>🏷️ Objects not detected yet
+      <span class="pill">${d.undetected_objects.length}</span></summary><div class="hbody"><ul>
+      ${d.undetected_objects.map(o => `<li>${esc(o.name)} — Not detected yet</li>`).join("")}</ul></div></details>`;
+  }
+  if (d.unconfigured_readers_with_detections && d.unconfigured_readers_with_detections.length) {
+    h += `<p class="map-note">Readers with detections but no configured location:
+      ${d.unconfigured_readers_with_detections.map(esc).join(", ")}</p>`;
+  }
+  return h;
+}
+
+function allReaders(d) {
+  const out = [];
+  (d.buildings || []).forEach(b => b.floors.forEach(f => f.rooms.forEach(r => r.readers.forEach(x => out.push(x)))));
+  return out;
+}
 
 async function loadLocationsPageData() {
-
-  if (
-    currentPage !==
-    "locations"
-  ) {
-    return;
+  const box = $("#locationHierarchy");
+  if (!box) return;
+  try {
+    const d = await api("/locations/hierarchy");
+    if (!Array.isArray(d.buildings)) throw new Error("Unexpected response from the backend.");
+    locData = d;
+    box.innerHTML = hierarchyHtml(d);
+    box.querySelectorAll("[data-edit-reader]").forEach(b => {
+      b.onclick = () => editReader(b.dataset.editReader);
+    });
+    renderLocMap(allReaders(d));
+  } catch (e) {
+    box.innerHTML = `<div style="padding:20px;color:#c05621">${esc(e.message)}</div>`;
+    setText("locMapNote", "Could not load reader locations.");
   }
-
-
-  const container =
-    $("#locationHierarchy");
-
-
-  if (!container) {
-    return;
-  }
-
-
-  /*
-   * Find all reader IDs that have
-   * actually detected an object.
-   */
-
-  const readerIds =
-    [
-      ...new Set(
-        objects
-          .map(
-            object =>
-              object.reader
-          )
-          .filter(
-            reader =>
-              reader &&
-              reader !== "—"
-          )
-      )
-    ];
-
-
-  if (
-    readerIds.length ===
-    0
-  ) {
-
-    container.innerHTML = `
-
-      <div
-        style="
-          padding:25px;
-          text-align:center;
-          color:#718096
-        "
-      >
-        No reader detections available yet.
-      </div>
-
-    `;
-
-    return;
-
-  }
-
-
-  const locations =
-    [];
-
-
-  for (
-    const readerId of
-    readerIds
-  ) {
-
-    const location =
-      await getReaderLocation(
-        readerId
-      );
-
-
-    if (
-      location
-    ) {
-
-      locations.push(
-        location
-      );
-
-    }
-
-  }
-
-
-  if (
-    locations.length ===
-    0
-  ) {
-
-    container.innerHTML = `
-
-      <div
-        style="
-          padding:25px;
-          text-align:center;
-          color:#718096
-        "
-      >
-        No configured reader locations found.
-      </div>
-
-    `;
-
-    return;
-
-  }
-
-
-  container.innerHTML =
-    locations
-      .map(
-        location => `
-
-          <div class="hier">
-
-            <b>
-              Building
-            </b>
-
-            <span>
-              ${escapeHtml(
-                location.building ||
-                "—"
-              )}
-            </span>
-
-          </div>
-
-
-          <div class="hier">
-
-            <b>
-              Floor
-            </b>
-
-            <span>
-              ${escapeHtml(
-                location.floor ||
-                "—"
-              )}
-            </span>
-
-          </div>
-
-
-          <div class="hier">
-
-            <b>
-              Room
-            </b>
-
-            <span>
-              ${escapeHtml(
-                location.room ||
-                "—"
-              )}
-            </span>
-
-          </div>
-
-
-          <div class="hier">
-
-            <b>
-              Reader ID
-            </b>
-
-            <span>
-              ${escapeHtml(
-                location.reader_id
-              )}
-            </span>
-
-          </div>
-
-        `
-      )
-      .join("");
-
 }
 
+function readerPopup(r) {
+  const last = r.last_detection;
+  return `<b>Reader ${esc(r.reader_id)}</b><br>${esc(locParts(r).join(" • "))}<br>` +
+    (last ? `Last: ${esc(last.name || last.nfc_uid)}<br>${esc(fmtTime(last.timestamp))}` : "No detections recorded yet.");
+}
 
-// =====================================================
-// ALERTS PAGE
-// =====================================================
+function renderLocMap(readers) {
+  const m = initMap("locMap");
+  if (!m) return;
+  m.markerLayer.clearLayers();
+  const pts = [];
+  readers.forEach(r => {
+    const c = coordsOf(r);
+    if (!c) return;
+    pts.push(c);
+    L.circleMarker(c, {
+      radius: 9, weight: 2, color: "#1b3f60", fillOpacity: 0.9,
+      fillColor: r.last_detection ? "#2a9d8f" : "#cbd5e0",
+    }).addTo(m.markerLayer).bindPopup(readerPopup(r)).on("click", () => highlightReader(r.reader_id));
+  });
+  if (pts.length) {
+    m.fitBounds(pts, { padding: [30, 30], maxZoom: 18 });
+    setText("locMapNote", `${pts.length} of ${readers.length} reader(s) have coordinates. Teal = has detections, grey = none yet. Markers show reader positions, not exact object positions.`);
+  } else {
+    m.setView([20, 0], 2);
+    setText("locMapNote", readers.length
+      ? "No reader has valid GPS coordinates configured yet."
+      : "No readers configured yet.");
+  }
+  setTimeout(() => m.invalidateSize(), 60);
+}
 
+function highlightReader(id) {
+  const el = document.getElementById("reader-" + rid(id));
+  if (!el) return;
+  for (let p = el; p; p = p.parentElement) if (p.tagName === "DETAILS") p.open = true;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("hl");
+  setTimeout(() => el.classList.remove("hl"), 2500);
+}
+
+function editReader(id) {
+  const r = locData ? allReaders(locData).find(x => x.reader_id === id) : null;
+  if (!r) return;
+  $("#fReader").value = r.reader_id;
+  $("#fBuilding").value = r.building;
+  $("#fFloor").value = r.floor;
+  $("#fRoom").value = r.room;
+  $("#fLat").value = r.latitude ?? "";
+  $("#fLng").value = r.longitude ?? "";
+  setText("formTitle", `Edit reader ${r.reader_id}`);
+  $("#readerForm").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function resetReaderForm() {
+  $("#readerForm")?.reset();
+  setText("formTitle", "Configure reader location");
+  setText("formMsg", "");
+}
+
+async function submitReaderForm(ev) {
+  ev.preventDefault();
+  const msg = t => setText("formMsg", t);
+  const readerId = $("#fReader").value.trim().toUpperCase();
+  const building = $("#fBuilding").value.trim();
+  const floor = $("#fFloor").value.trim();
+  const room = $("#fRoom").value.trim();
+  const latS = $("#fLat").value.trim(), lngS = $("#fLng").value.trim();
+
+  if (!/^[A-Z0-9_-]{1,32}$/.test(readerId)) return msg("Reader ID must be 1-32 characters: letters, digits, - or _.");
+  if (!building || !floor || !room) return msg("Building, floor and room are required.");
+  if ((latS === "") !== (lngS === "")) return msg("Enter both latitude and longitude, or leave both empty.");
+
+  let latitude = null, longitude = null;
+  if (latS !== "") {
+    latitude = Number(latS); longitude = Number(lngS);
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) return msg("Latitude must be a number between -90 and 90.");
+    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) return msg("Longitude must be a number between -180 and 180.");
+  }
+
+  const btn = $("#fSave");
+  btn.disabled = true;
+  msg("Saving…");
+  try {
+    const res = await api("/readers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reader_id: readerId, building, floor, room, latitude, longitude }),
+    });
+    toast(res.message || "Reader saved");
+    resetReaderForm();
+    await refreshObjects(false);
+    await loadLocationsPageData();
+  } catch (e) {
+    msg(e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------------- ALERTS ----------------
 function alertsPage() {
-
-  const attentionObjects =
-    objects.filter(
-      object =>
-        !object.timestamp
-    );
-
-
+  const attention = objects.filter(o => !o.detection);
   return `
-
-    <div class="intro">
-
-      <div>
-
-        <h2>
-          Alerts
-        </h2>
-
-        <p>
-          Objects that may need caregiver
-          attention.
-        </p>
-
-      </div>
-
-    </div>
-
-
-    <div id="alertsContainer">
-
-      ${
-        attentionObjects.length ===
-        0
-
-          ? `
-
-            <section class="panel">
-
-              <h3>
-                ✓ No attention needed
-              </h3>
-
-              <p
-                style="
-                  font-size:10px;
-                  color:#718096;
-                  margin-top:6px
-                "
-              >
-
-                All registered objects have
-                at least one recorded NFC
-                detection.
-
-              </p>
-
-            </section>
-
-          `
-
-          :
-
-            attentionObjects
-              .map(
-                object => `
-
-                  <section
-                    class="alert"
-                  >
-
-                    <div
-                      class="alert-icon"
-                    >
-                      ⚠
-                    </div>
-
-
-                    <div class="grow">
-
-                      <span
-                        class="warning"
-                        style="
-                          font-size:8px;
-                          font-weight:800
-                        "
-                      >
-                        ATTENTION NEEDED
-                      </span>
-
-
-                      <h3>
-
-                        ${escapeHtml(
-                          object.name
-                        )}
-
-                        has not been detected
-
-                      </h3>
-
-
-                      <p>
-
-                        No NFC detection has
-                        been recorded for this
-                        object yet.
-
-                      </p>
-
-                    </div>
-
-
-                    <button
-                      class="primary"
-                      data-object="${
-                        escapeHtml(
-                          object.id
-                        )
-                      }"
-                    >
-                      Find object
-                    </button>
-
-                  </section>
-
-                `
-              )
-              .join("")
-
-      }
-
-    </div>
-
-
-    <section
-      class="panel"
-      style="
-        margin-top:15px
-      "
-    >
-
-      <h3>
-        How alerts work
-      </h3>
-
-      <p
-        style="
-          font-size:10px;
-          color:#718096;
-          line-height:1.6
-        "
-      >
-
-        Currently, an object is marked for
-        attention when it has no recorded
-        detection.
-
-        A future version can use time-based
-        rules, such as alerting when an object
-        has not been detected for a defined
-        period.
-
-      </p>
-
-    </section>
-
-  `;
-
+  <div class="intro"><div><h2>Alerts</h2><p>Objects that may need caregiver attention.</p></div></div>
+  <div id="alertsContainer">
+    ${attention.length === 0
+      ? `<section class="panel"><h3>✓ No attention needed</h3>
+          <p style="font-size:10px;color:#718096;margin-top:6px">All registered objects have at least one recorded NFC detection.</p></section>`
+      : attention.map(o => `
+        <section class="alert"><div class="alert-icon">⚠</div>
+          <div class="grow"><span class="warning" style="font-size:8px;font-weight:800">ATTENTION NEEDED</span>
+            <h3>${esc(o.name)} has not been detected</h3>
+            <p>No NFC detection has been recorded for this object yet.</p></div>
+          <button class="primary" data-object="${esc(o.id)}">Find object</button></section>`).join("")}
+  </div>
+  <section class="panel" style="margin-top:15px"><h3>How alerts work</h3>
+    <p style="font-size:10px;color:#718096;line-height:1.6">Currently an object needs attention when it has no recorded
+      detection. A future version can alert when an object has not been seen for a defined period.</p></section>`;
 }
 
-
-// =====================================================
-// ALERT PAGE REFRESH
-// =====================================================
-
-async function loadAlertsPageData() {
-
-  if (
-    currentPage !==
-    "alerts"
-  ) {
-    return;
-  }
-
-
-  await updateObjectDetectionInfo();
-
-
-  const container =
-    $("#alertsContainer");
-
-
-  if (!container) {
-    return;
-  }
-
-
-  const attentionObjects =
-    objects.filter(
-      object =>
-        !object.timestamp
-    );
-
-
-  if (
-    attentionObjects.length ===
-    0
-  ) {
-
-    container.innerHTML = `
-
-      <section class="panel">
-
-        <h3>
-          ✓ No attention needed
-        </h3>
-
-        <p
-          style="
-            font-size:10px;
-            color:#718096;
-            margin-top:6px
-          "
-        >
-
-          All registered objects have
-          at least one recorded NFC
-          detection.
-
-        </p>
-
-      </section>
-
-    `;
-
-    return;
-
-  }
-
-
-  container.innerHTML =
-    attentionObjects
-      .map(
-        object => `
-
-          <section
-            class="alert"
-          >
-
-            <div class="alert-icon">
-              ⚠
-            </div>
-
-
-            <div class="grow">
-
-              <span
-                class="warning"
-                style="
-                  font-size:8px;
-                  font-weight:800
-                "
-              >
-                ATTENTION NEEDED
-              </span>
-
-
-              <h3>
-                ${escapeHtml(
-                  object.name
-                )}
-                has not been detected
-              </h3>
-
-
-              <p>
-                No NFC detection has
-                been recorded for this object.
-              </p>
-
-            </div>
-
-
-            <button
-              class="primary"
-              data-object="${
-                escapeHtml(
-                  object.id
-                )
-              }"
-            >
-              Find object
-            </button>
-
-          </section>
-
-        `
-      )
-      .join("");
-
-}
-
-
-// =====================================================
-// VOICE PAGE
-// =====================================================
-
+// ---------------- VOICE INTERACTION ----------------
 function voicePage() {
-
+  const supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
   return `
-
-    <section class="voice-card">
-
-      <span class="voice-label">
-        VOICE-ASSISTED OBJECT SEARCH
-      </span>
-
-
-      <h2>
-        Ask where an object is
-      </h2>
-
-
-      <p>
-        Use your microphone or try the
-        demo phrase below.
-      </p>
-
-
-      <button
-        class="mic"
-        id="mic"
-      >
-        🎙
-      </button>
-
-
-      <div
-        class="transcript"
-        id="transcript"
-      >
-        Tap the microphone and say:
-
-        <b>
-          "Where are my keys?"
-        </b>
-
-      </div>
-
-
-      <div
-        class="answer"
-        id="answer"
-      ></div>
-
-
-      <button
-        class="secondary"
-        id="demoVoice"
-      >
-        Try demo phrase
-      </button>
-
-    </section>
-
-  `;
-
+  <section class="voice-card">
+    <span class="voice-label">VOICE-ASSISTED OBJECT SEARCH</span>
+    <h2>Ask where an object is</h2>
+    <p>Use your microphone, type a question, or try the demo phrase below.</p>
+    <button class="mic" id="mic" title="Start / stop listening">🎙</button>
+    ${supported ? "" : `<p class="errbox">Speech recognition is not supported in this browser (try Chrome or Edge). Use the text box instead.</p>`}
+    <div class="transcript" id="transcript">Tap the microphone and say: <b>“Where are my keys?”</b></div>
+    <div class="manual">
+      <input id="voiceText" placeholder="Or type: Where is my wallet?">
+      <button class="primary" id="voiceAsk">Ask</button>
+    </div>
+    <div class="answer" id="answer"></div>
+    <div id="voiceMapWrap" class="hidden">
+      <div class="voice-map"><div class="gis-map" id="voiceMap"></div></div>
+      <div class="map-note" id="voiceMapNote"></div>
+    </div>
+    <button class="secondary" id="demoVoice" style="margin-top:12px">Try demo phrase</button>
+  </section>`;
 }
 
+const STOP = new Set(["where", "is", "are", "my", "the", "a", "an", "our", "find", "locate", "please", "object", "uid", "of", "me", "show", "to", "tell"]);
+const ALIASES = { spectacles: "glasses", specs: "glasses", tablets: "medicine", tablet: "medicine", pills: "medicine", pill: "medicine", purse: "wallet" };
 
-// =====================================================
-// VOICE OBJECT MATCHING
-// =====================================================
-
-function findObjectFromSpeech(
-  text
-) {
-
-  const lower =
-    text.toLowerCase();
-
-
-  /*
-   * Exact / partial registered
-   * object name matching.
-   */
-
-  let object =
-    objects.find(
-      item =>
-        lower.includes(
-          item.name.toLowerCase()
-        )
-    );
-
-
-  if (object) {
-    return object;
-  }
-
-
-  /*
-   * Common natural-language
-   * aliases.
-   */
-
-  const aliases = {
-
-    keys:
-      [
-        "key",
-        "keys"
-      ],
-
-    glasses:
-      [
-        "glass",
-        "glasses",
-        "spectacles"
-      ],
-
-    medicine:
-      [
-        "medicine",
-        "medicines",
-        "tablet",
-        "tablets",
-        "pills",
-        "medicine box"
-      ],
-
-    wallet:
-      [
-        "wallet",
-        "purse"
-      ]
-
-  };
-
-
-  for (
-    const [
-      type,
-      words
-    ]
-    of Object.entries(
-      aliases
-    )
-  ) {
-
-    const matched =
-      words.some(
-        word =>
-          lower.includes(
-            word
-          )
-      );
-
-
-    if (!matched) {
-      continue;
-    }
-
-
-    object =
-      objects.find(
-        item =>
-          item.name
-            .toLowerCase()
-            .includes(
-              type
-            )
-      );
-
-
-    if (object) {
-      return object;
-    }
-
-  }
-
-
-  return null;
-
+function extractQuery(text) {
+  let t = text.toLowerCase().replace(/[?.!,]/g, " ").replace(/\s+/g, " ").trim();
+  t = t.replace(/^(please |can you |could you )/, "");
+  t = t.replace(/^(where(?:'s| is| are)|find|locate|show me|look for|search for|tell me where)\s+/, "");
+  t = t.replace(/^(object (uid|id)|nfc uid|uid)\s+/, "");
+  t = t.replace(/^(my|the|a|an|our)\s+/, "").replace(/\s+(please|now)$/, "").trim();
+  return t;
 }
 
+async function searchObjects(q) {
+  const d = await api(`/objects/search?q=${encodeURIComponent(q)}`);
+  return Array.isArray(d.matches) ? d.matches : [];
+}
 
-// =====================================================
-// VOICE ANSWER
-// =====================================================
+async function voiceSearch(q) {
+  const compact = q.replace(/[\s-]/g, "").toUpperCase();
+  if (/^[0-9A-F]{8,}$/.test(compact)) return searchObjects(compact);
 
-async function showVoiceAnswer(
-  text
-) {
+  let m = await searchObjects(q);
+  if (m.length) return m;
 
-  const transcript =
-    $("#transcript");
-
-  const answer =
-    $("#answer");
-
-
-  if (
-    transcript
-  ) {
-
-    transcript.innerHTML =
-      `<b>“${escapeHtml(
-        text
-      )}”</b>`;
-
+  // Fallback: search each meaningful word (with a few aliases) and merge
+  const tokens = [...new Set(q.split(" ").filter(w => w.length > 2 && !STOP.has(w)).map(w => ALIASES[w] || w))];
+  const seen = new Map();
+  for (const t of tokens) {
+    for (const e of await searchObjects(t)) seen.set(e.object.nfc_uid, e);
   }
+  return [...seen.values()];
+}
 
+function setTranscript(html) {
+  const t = $("#transcript");
+  if (t) t.innerHTML = html;
+}
 
-  const object =
-    findObjectFromSpeech(
-      text
-    );
+function showAnswer(html) {
+  const a = $("#answer");
+  if (!a) return;
+  a.style.display = "block";
+  a.innerHTML = html;
+}
 
+function speak(sentence) {
+  if (!("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(sentence);
+  u.lang = "en-US";
+  window.speechSynthesis.speak(u);
+}
 
-  if (!object) {
+function buildSentence(o) {
+  const d = o.detection;
+  if (!d) return `I found the registered object, ${o.name}, but it has not been detected yet.`;
+  const parts = locParts(o.location);
+  let s = `Your ${o.name} was last detected by reader ${d.reader_id}`;
+  if (parts.length) s += ` in ${parts.join(", ")}`;
+  s += `, at ${spokenTime(d.timestamp)}.`;
+  if (!parts.length) s += " The location of that reader has not been configured.";
+  return s;
+}
 
-    if (answer) {
-
-      answer.style.display =
-        "block";
-
-
-      answer.innerHTML = `
-
-        <b>
-          🏷️ Object not found
-        </b>
-
-
-        <small>
-
-          I could not identify a
-          registered object from
-          that request.
-
-        </small>
-
-      `;
-
-    }
-
+async function handleVoiceQuery(text, doSpeak = true) {
+  setTranscript(`<b>“${esc(text)}”</b>`);
+  const q = extractQuery(text);
+  if (!q) {
+    const s = "I did not catch an object name. Please try again.";
+    showAnswer(`<b>${esc(s)}</b>`);
+    if (doSpeak) speak(s);
     return;
-
   }
+  showAnswer(loadingBox("Searching…"));
+  $("#voiceMapWrap")?.classList.add("hidden");
 
-
-  /*
-   * Get fresh backend data.
-   */
-
-  const detection =
-    await getLatestDetection(
-      object.id,
-      true
-    );
-
-
-  if (!detection) {
-
-    if (answer) {
-
-      answer.style.display =
-        "block";
-
-
-      answer.innerHTML = `
-
-        <b>
-          ${object.icon}
-          ${escapeHtml(
-            object.name
-          )}
-        </b>
-
-
-        <small>
-
-          No detection has been
-          recorded for this object yet.
-
-        </small>
-
-      `;
-
-    }
-
+  let matches;
+  try {
+    matches = await voiceSearch(q);
+  } catch (e) {
+    showAnswer(errBox(e.message));
     return;
-
   }
 
-
-  const location =
-    await getReaderLocation(
-      detection.reader_id,
-      true
-    );
-
-
-  if (answer) {
-
-    answer.style.display =
-      "block";
-
-
-    if (location) {
-
-      answer.innerHTML = `
-
-        <b>
-
-          ${object.icon}
-
-          ${escapeHtml(
-            object.name
-          )}
-
-        </b>
-
-
-        <small>
-
-          Last detected at
-
-          <strong>
-            ${escapeHtml(
-              location.room
-            )}
-          </strong>
-
-          •
-          ${escapeHtml(
-            location.building
-          )}
-
-          •
-          ${escapeHtml(
-            location.floor
-          )}
-
-          • Reader
-          ${escapeHtml(
-            location.reader_id
-          )}
-
-          •
-          ${formatTimestamp(
-            detection.timestamp
-          )}
-
-        </small>
-
-      `;
-
-    } else {
-
-      answer.innerHTML = `
-
-        <b>
-
-          ${object.icon}
-
-          ${escapeHtml(
-            object.name
-          )}
-
-        </b>
-
-
-        <small>
-
-          Last detected by Reader
-          ${escapeHtml(
-            detection.reader_id
-          )}
-
-          •
-
-          ${formatTimestamp(
-            detection.timestamp
-          )}
-
-        </small>
-
-      `;
-
-    }
-
+  if (matches.length === 0) {
+    const s = `I could not find a registered object matching ${q}.`;
+    showAnswer(`<b>🏷️ Object not found</b><small>${esc(s)}</small>`);
+    if (doSpeak) speak(s);
+  } else if (matches.length > 1) {
+    const names = matches.map(m => m.object.name).join(", ");
+    showAnswer(chooserHtml(matches));
+    bindPicks($("#answer"), async uid => {
+      try { await showVoiceResult(await fetchObject(uid), true); } catch (e) { showAnswer(errBox(e.message)); }
+    });
+    if (doSpeak) speak(`I found several matching objects: ${names}. Please select one.`);
+  } else {
+    await showVoiceResult(fromEntry(matches[0]), doSpeak);
   }
-
 }
 
+async function showVoiceResult(o, doSpeak) {
+  voiceUid = o.id;
+  const d = o.detection, l = o.location, c = d ? coordsOf(l) : null;
+  const sentence = buildSentence(o);
 
-// =====================================================
-// DEMO VOICE
-// =====================================================
-
-function simulateVoice() {
-
-  if (
-    objects.length ===
-    0
-  ) {
-
-    toast(
-      "No registered objects available"
-    );
-
-    return;
-
+  let h = `<b>${o.icon} ${esc(o.name)}</b><small>NFC UID: ${esc(o.id)}</small>`;
+  if (!d) {
+    h += `<small>Not detected yet.</small>`;
+  } else {
+    h += `<small>Last detected: ${esc(fmtTime(d.timestamp))} • Reader ${esc(d.reader_id)}</small>`;
+    h += l
+      ? `<small>Location: ${esc(locParts(l).join(" • ") || "Details incomplete")}</small>`
+      : `<small>Location not configured for reader ${esc(d.reader_id)}.</small>`;
+    h += c ? `<small>Latitude ${c[0]}, Longitude ${c[1]} • ${osmLink(c)}</small>`
+           : `<small>GPS coordinates not configured.</small>`;
   }
-
-
-  /*
-   * Prefer House Keys if
-   * registered, otherwise
-   * use the first object.
-   */
-
-  const keys =
-    objects.find(
-      object =>
-        object.name
-          .toLowerCase()
-          .includes(
-            "key"
-          )
-    );
-
-
-  const phrase =
-    keys
-      ? "Where are my keys?"
-      : `Where is my ${objects[0].name}?`;
-
-
-  showVoiceAnswer(
-    phrase
-  );
-
+  h += `<small class="spoken">“${esc(sentence)}”</small>`;
+  showAnswer(h);
+  updateVoiceMap(o);
+  if (doSpeak) speak(sentence);
 }
 
-
-// =====================================================
-// REAL BROWSER SPEECH RECOGNITION
-// =====================================================
+function updateVoiceMap(o) {
+  const wrap = $("#voiceMapWrap"), div = $("#voiceMap");
+  if (!wrap || !div) return;
+  wrap.classList.remove("hidden");
+  const d = o.detection, c = d ? coordsOf(o.location) : null;
+  if (!c) {
+    div.style.display = "none";
+    const known = locParts(o.location).join(" • ");
+    setText("voiceMapNote", !d
+      ? "Not detected yet, so there is no location to map."
+      : `${known ? `Known location: ${known}. ` : ""}Geographic coordinates are unavailable.`);
+    return;
+  }
+  div.style.display = "block";
+  plotObject("voiceMap", o);
+  maps.voiceMap?.invalidateSize();
+  setText("voiceMapNote", "Marker = the reader's configured location, not necessarily the object's exact position.");
+}
 
 function listen() {
-
-  const Recognition =
-    window.SpeechRecognition ||
-    window.webkitSpeechRecognition;
-
-
-  if (!Recognition) {
-
-    toast(
-      "Speech recognition is not supported here"
-    );
-
-    simulateVoice();
-
+  const R = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!R) {
+    toast("Speech recognition is not supported in this browser. Use the text box.", true);
+    $("#voiceText")?.focus();
     return;
-
   }
+  if (recognizing) { activeRec?.stop(); return; }   // prevents overlapping sessions
 
+  const rec = new R();
+  activeRec = rec;
+  rec.lang = "en-US";
+  rec.interimResults = false;
+  rec.maxAlternatives = 1;
+  let handled = false;
 
-  const recognition =
-    new Recognition();
-
-
-  recognition.lang =
-    "en-US";
-
-
-  recognition.interimResults =
-    false;
-
-
-  recognition.maxAlternatives =
-    1;
-
-
-  const transcript =
-    $("#transcript");
-
-
-  if (
-    transcript
-  ) {
-
-    transcript.innerHTML =
-      "🎙 Listening...";
-
-  }
-
-
-  recognition.onresult =
-    event => {
-
-      const text =
-        event
-          .results[0][0]
-          .transcript;
-
-
-      showVoiceAnswer(
-        text
-      );
-
-    };
-
-
-  recognition.onerror =
-    event => {
-
-      console.error(
-        "Speech recognition error:",
-        event.error
-      );
-
-
-      toast(
-        "Could not understand voice input"
-      );
-
-    };
-
-
-  recognition.onend =
-    () => {
-
-      if (
-        transcript &&
-        transcript.textContent ===
-          "🎙 Listening..."
-      ) {
-
-        transcript.textContent =
-          "Tap the microphone and try again.";
-
-      }
-
-    };
-
-
-  recognition.start();
-
+  rec.onstart = () => {
+    recognizing = true;
+    $("#mic")?.classList.add("listening");
+    setTranscript("🎙 Listening… (tap the microphone again to stop)");
+  };
+  rec.onresult = e => {
+    handled = true;
+    const text = (e.results[0][0].transcript || "").trim();
+    if (!text) { setTranscript("I did not hear anything. Please try again."); return; }
+    handleVoiceQuery(text, true);
+  };
+  rec.onerror = e => {
+    handled = true;
+    const m = {
+      "not-allowed": "Microphone access was denied. Allow it in the browser's site settings.",
+      "service-not-allowed": "Microphone access was denied. Allow it in the browser's site settings.",
+      "no-speech": "No speech was detected. Please try again.",
+      "audio-capture": "No microphone was found.",
+      "network": "Speech recognition needs a network connection.",
+      "aborted": "Listening was stopped.",
+    }[e.error] || "Speech recognition failed. Please try again or use the text box.";
+    setTranscript(esc(m));
+    toast(m, true);
+  };
+  rec.onend = () => {
+    recognizing = false;
+    activeRec = null;
+    $("#mic")?.classList.remove("listening");
+    if (!handled) setTranscript("Tap the microphone and try again.");
+  };
+  try { rec.start(); } catch (e) { recognizing = false; toast("Could not start listening", true); }
 }
 
-
-// =====================================================
-// SIMULATED NFC SCAN
-// =====================================================
-
-async function simulateNFCScan() {
-
-  if (
-    objects.length ===
-    0
-  ) {
-
-    toast(
-      "No registered objects"
-    );
-
-    return;
-
-  }
-
-
-  /*
-   * This is intentionally a UI simulation.
-   *
-   * The browser cannot directly read the
-   * PN532 connected to the ESP32.
-   */
-
-  const object =
-    objects[0];
-
-
-  toast(
-    `Demo scan: ${object.name}`
-  );
-
-
-  /*
-   * Take the user to Find Object
-   * and populate the UID.
-   */
-
-  selected =
-    object;
-
-
-  currentPage =
-    "find";
-
-
-  window.findTerm =
-    object.id;
-
-
-  render();
-
-
-  /*
-   * Automatically perform lookup.
-   */
-
-  setTimeout(
-    () =>
-      performLookup(
-        object.id
-      ),
-    100
-  );
-
-}
-
-
-// =====================================================
-// BIND ALL PAGE EVENTS
-// =====================================================
-
+// ---------------- EVENT BINDING ----------------
 function bind() {
+  $("#addObjectBtn") && ($("#addObjectBtn").onclick = showAddObjectForm);
 
+  const scan = $("#scan");
+  if (scan) scan.onclick = async () => { await refreshObjects(true); render(); toast("Detections refreshed"); };
 
-  // ===================================================
-  // ADD OBJECT
-  // ===================================================
-
-  const addObjectBtn =
-    $("#addObjectBtn");
-
-
-  if (
-    addObjectBtn
-  ) {
-
-    addObjectBtn.onclick =
-      showAddObjectForm;
-
-  }
-
-
-  // ===================================================
-  // DASHBOARD
-  // ===================================================
-
-  const scan =
-    $("#scan");
-
-
-  if (
-    scan
-  ) {
-
-    scan.onclick =
-      simulateNFCScan;
-
-  }
-
-
-  // ===================================================
-  // OBJECT BUTTONS
-  // ===================================================
-
-  document
-    .querySelectorAll(
-      "[data-object]"
-    )
-    .forEach(
-      button => {
-
-        button.onclick =
-          () => {
-
-            const object =
-              getObject(
-                button.dataset.object
-              );
-
-
-            if (!object) {
-              return;
-            }
-
-
-            selected =
-              object;
-
-
-            window.findTerm =
-              object.id;
-
-
-            nav(
-              "find"
-            );
-
-          };
-
+  document.querySelectorAll("[data-object]").forEach(b => {
+    b.onclick = () => {
+      const o = objects.find(x => x.id === b.dataset.object);
+      if (!o) return;
+      findUid = o.id;
+      findTerm = o.name;
+      if (currentPage === "find") {
+        const s = $("#search");
+        if (s) s.value = o.name;
+        showFind(o.id);
+      } else {
+        nav("find");
       }
-    );
+    };
+  });
 
-
-  // ===================================================
-  // FIND / SEARCH
-  // ===================================================
-
-  const search =
-    $("#search");
-
-
-  if (
-    search
-  ) {
-
-    search.addEventListener(
-      "input",
-      () => {
-
-        window.findTerm =
-          search.value;
-
-      }
-    );
-
-
-    search.addEventListener(
-      "keydown",
-      event => {
-
-        if (
-          event.key ===
-          "Enter"
-        ) {
-
-          performLookup(
-            search.value
-          );
-
-        }
-
-      }
-    );
-
+  const search = $("#search");
+  if (search) {
+    search.addEventListener("input", () => { findTerm = search.value; });
+    search.addEventListener("keydown", e => { if (e.key === "Enter") performLookup(search.value); });
   }
+  const lookup = $("#lookupNFC");
+  if (lookup) lookup.onclick = () => performLookup($("#search")?.value || "");
 
+  const route = $("#route");
+  if (route) route.onclick = () => {
+    if (findCoords) window.open(osmUrl(findCoords), "_blank", "noopener");
+    else toast("GPS coordinates are not configured for this object's reader", true);
+  };
 
-  // ===================================================
-  // LOOKUP BUTTON
-  // ===================================================
+  const tag = $("#historyTag");
+  if (tag) tag.onchange = () => loadHistory(tag.value);
 
-  const lookupNFC =
-    $("#lookupNFC");
-
-
-  if (
-    lookupNFC
-  ) {
-
-    lookupNFC.onclick =
-      () => {
-
-        const value =
-          $("#search")
-            ?.value ||
-          "";
-
-
-        performLookup(
-          value
-        );
-
-      };
-
+  const mic = $("#mic");
+  if (mic) mic.onclick = listen;
+  const ask = $("#voiceAsk"), vt = $("#voiceText");
+  if (ask && vt) {
+    const go = () => { const t = vt.value.trim(); if (t) handleVoiceQuery(t, true); else toast("Type a question first", true); };
+    ask.onclick = go;
+    vt.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
   }
+  const demo = $("#demoVoice");
+  if (demo) demo.onclick = () => handleVoiceQuery("Where are my keys?", true);
 
-
-  // ===================================================
-  // ROUTE / LOCATION
-  // ===================================================
-
-  const route =
-    $("#route");
-
-
-  if (
-    route
-  ) {
-
-    route.onclick =
-      () => {
-
-        const room =
-          $("#locationRoom")
-            ?.textContent;
-
-
-        if (
-          room &&
-          room !== "—" &&
-          room !==
-            "Location unavailable"
-        ) {
-
-          toast(
-            `Last known location: ${room}`
-          );
-
-        } else {
-
-          toast(
-            "Find an NFC tag first"
-          );
-
-        }
-
-      };
-
+  const form = $("#readerForm");
+  if (form) {
+    form.onsubmit = submitReaderForm;
+    $("#fReset").onclick = resetReaderForm;
   }
-
-
-  // ===================================================
-  // HISTORY
-  // ===================================================
-
-  const historyTag =
-    $("#historyTag");
-
-
-  if (
-    historyTag
-  ) {
-
-    historyTag.onchange =
-      () => {
-
-        loadHistory(
-          historyTag.value
-        );
-
-      };
-
-  }
-
-
-  // ===================================================
-  // VOICE
-  // ===================================================
-
-  const mic =
-    $("#mic");
-
-
-  if (
-    mic
-  ) {
-
-    mic.onclick =
-      listen;
-
-  }
-
-
-  const demoVoice =
-    $("#demoVoice");
-
-
-  if (
-    demoVoice
-  ) {
-
-    demoVoice.onclick =
-      simulateVoice;
-
-  }
-
-
 }
 
-
-// =====================================================
-// AUTOMATIC LIVE REFRESH
-// =====================================================
-
-function startLiveRefresh() {
-
-  if (
-    dashboardRefreshTimer
-  ) {
-
-    clearInterval(
-      dashboardRefreshTimer
-    );
-
+// ---------------- AUTOMATIC REFRESH ----------------
+async function refreshCurrentPage() {
+  switch (currentPage) {
+    case "find": if (findUid) await showFind(findUid); break;
+    case "voice":
+      if (voiceUid) {
+        try { await showVoiceResult(await fetchObject(voiceUid), false); } catch { /* ignore */ }
+      }
+      break;
+    case "locations": await loadLocationsPageData(); break;
+    case "history": await loadInitialHistory(); break;
+    default: render();
   }
-
-
-  /*
-   * Refresh backend data every
-   * 15 seconds.
-   *
-   * This is enough for an MVP without
-   * constantly hammering the backend.
-   */
-
-  dashboardRefreshTimer =
-    setInterval(
-      async () => {
-
-        if (
-          currentPage ===
-          "dashboard"
-        ) {
-
-          await loadDashboardDetections();
-
-        }
-
-      },
-      15000
-    );
-
 }
 
+async function poll() {
+  if (polling || document.hidden) return;   // never overlap requests
+  polling = true;
+  try {
+    const d = await api("/detections/latest-id");
+    const id = d.latest_detection_id;
+    const changed = lastDetId !== null && id !== lastDetId;
+    if (needsReload || changed) {
+      needsReload = false;
+      await refreshObjects(false);
+      await refreshCurrentPage();
+    }
+    lastDetId = id;
+  } catch { /* offline state already shown */ }
+  finally { polling = false; }
+}
 
-// =====================================================
-// INITIALIZATION
-// =====================================================
-
+// ---------------- INIT ----------------
 async function initializeApp() {
-
-  /*
-   * Load objects from backend FIRST.
-   */
-
-  await refreshObjects(
-    false
-  );
-
-
-  /*
-   * Then render the application.
-   */
-
+  await refreshObjects(false);
+  try {
+    lastDetId = (await api("/detections/latest-id")).latest_detection_id;
+  } catch { lastDetId = null; }
   render();
-
-
-  /*
-   * Start live dashboard updates.
-   */
-
-  startLiveRefresh();
-
+  setInterval(poll, POLL_MS);
 }
-
-
-// =====================================================
-// START APPLICATION
-// =====================================================
 
 initializeApp();
