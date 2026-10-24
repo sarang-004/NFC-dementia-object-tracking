@@ -1,37 +1,210 @@
+```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CareTrack | NFC Smart Object Tracking</title>
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
-<div class="app">
-  <aside class="sidebar">
-    <div class="brand"><div class="logo">NFC</div><div><b>CareTrack</b><small>Smart Object Tracking</small></div></div>
-    <div class="profile"><div class="avatar">C</div><div><b>Caregiver</b><small>Home monitoring</small></div><span class="online"></span></div>
-    <nav>
-      <button class="nav active" data-page="dashboard">⌂ <span>Dashboard</span></button>
-      <button class="nav" data-page="find">⌕ <span>Find Object</span></button>
-      <button class="nav" data-page="voice">🎙 <span>Voice Interaction</span></button>
-      <button class="nav" data-page="objects">▣ <span>Tagged Objects</span></button>
-      <button class="nav" data-page="history">◷ <span>Activity History</span></button>
-      <button class="nav" data-page="locations">⌖ <span>Locations</span></button>
-      <button class="nav" data-page="alerts">⚠ <span>Alerts</span><i>1</i></button>
-    </nav>
-    <div class="sidebar-bottom"><div class="system"><span class="online"></span><div><b>System online</b><small>Demo reader network ready</small></div></div><small>Frontend prototype • v2.0</small></div>
-  </aside>
 
-  <main>
-    <header class="topbar">
-      <div><p>CAREGIVER PORTAL</p><h1 id="pageTitle">Dashboard</h1></div>
-      <div class="top-actions"><span class="live">● Live monitoring</span><button id="bell">🔔</button><div class="avatar">C</div></div>
-    </header>
-    <div id="content"></div>
-  </main>
-</div>
-<div id="toast"></div>
-<script src="script.js"></script>
+  <title>CareTrack | NFC Smart Object Tracking</title>
+
+  <!-- Leaflet GIS Map Stylesheet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  >
+
+  <!-- Main Application Stylesheet -->
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Additional CareTrack Styles -->
+  <link rel="stylesheet" href="caretrack-additions.css">
+</head>
+
+<body>
+
+  <div class="app">
+
+    <!-- ==================== SIDEBAR ==================== -->
+    <aside class="sidebar">
+
+      <!-- Brand -->
+      <div class="brand">
+        <div class="logo">NFC</div>
+
+        <div>
+          <b>CareTrack</b>
+          <small>Smart Object Tracking</small>
+        </div>
+      </div>
+
+      <!-- Caregiver Profile -->
+      <div class="profile">
+        <div class="avatar">C</div>
+
+        <div>
+          <b>Caregiver</b>
+          <small>Home monitoring</small>
+        </div>
+
+        <span class="online" aria-label="Profile online"></span>
+      </div>
+
+      <!-- Navigation -->
+      <nav aria-label="Main navigation">
+
+        <button
+          type="button"
+          class="nav active"
+          data-page="dashboard"
+          aria-current="page"
+        >
+          ⌂ <span>Dashboard</span>
+        </button>
+
+        <button
+          type="button"
+          class="nav"
+          data-page="find"
+        >
+          ⌕ <span>Find Object</span>
+        </button>
+
+        <button
+          type="button"
+          class="nav"
+          data-page="voice"
+        >
+          🎙 <span>Voice Interaction</span>
+        </button>
+
+        <button
+          type="button"
+          class="nav"
+          data-page="objects"
+        >
+          ▣ <span>Tagged Objects</span>
+        </button>
+
+        <button
+          type="button"
+          class="nav"
+          data-page="history"
+        >
+          ◷ <span>Activity History</span>
+        </button>
+
+        <button
+          type="button"
+          class="nav"
+          data-page="locations"
+        >
+          ⌖ <span>Locations</span>
+        </button>
+
+        <button
+          type="button"
+          class="nav"
+          data-page="alerts"
+        >
+          ⚠ <span>Alerts</span>
+          <i id="alertBadge">0</i>
+        </button>
+
+      </nav>
+
+      <!-- Sidebar Footer / Backend Status -->
+      <div class="sidebar-bottom">
+
+        <div class="system">
+
+          <span
+            class="online"
+            id="sysDot"
+            aria-hidden="true"
+          ></span>
+
+          <div>
+            <b id="sysStatus">Checking backend…</b>
+            <small id="sysDetail">Connecting to the API</small>
+          </div>
+
+        </div>
+
+        <small>Frontend prototype • v2.1</small>
+
+      </div>
+
+    </aside>
+    <!-- ==================== END SIDEBAR ==================== -->
+
+
+    <!-- ==================== MAIN CONTENT ==================== -->
+    <main>
+
+      <!-- Top Header -->
+      <header class="topbar">
+
+        <div>
+          <p>CAREGIVER PORTAL</p>
+          <h1 id="pageTitle">Dashboard</h1>
+        </div>
+
+        <div class="top-actions">
+
+          <!-- Dynamic API / Live Status -->
+          <span
+            class="live"
+            id="liveStatus"
+            role="status"
+            aria-live="polite"
+          >
+            ● Connecting…
+          </span>
+
+          <!-- Notification Button -->
+          <button
+            type="button"
+            id="bell"
+            aria-label="Notifications"
+            title="Notifications"
+          >
+            🔔
+          </button>
+
+          <!-- Caregiver Avatar -->
+          <div class="avatar">C</div>
+
+        </div>
+
+      </header>
+
+      <!-- Dynamic Page Content -->
+      <div id="content"></div>
+
+    </main>
+    <!-- ==================== END MAIN CONTENT ==================== -->
+
+  </div>
+
+
+  <!-- Global Toast / Notification Container -->
+  <div
+    id="toast"
+    role="status"
+    aria-live="polite"
+  ></div>
+
+
+  <!-- ==================== JAVASCRIPT ==================== -->
+
+  <!-- Leaflet GIS Mapping Library -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Main CareTrack Application Logic -->
+  <script src="script.js"></script>
+
+  <!-- ==================== END JAVASCRIPT ==================== -->
+
 </body>
 </html>
+```
